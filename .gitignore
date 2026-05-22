@@ -1,0 +1,40 @@
+# MATLAB Editor Autosaves
+*.asv
+
+# MATLAB Workspace variables & data files
+*.mat
+
+# MATLAB compiler and MEX binaries
+*.mex*
+*.dll
+*.so
+*.dylib
+
+# Simulink active state and project caches
+slprj/
+*.slxc
+*.mx3
+
+# App Designer / GUI compilation & packaging artifacts
+*.mlappinstall
+*.mlapp
+*.prd
+
+# Temporary crash logs and command history
+matlab.log
+octave-workspace
+*.log
+New Text Document.txt
+
+# Local figures or generated reports
+*.png
+*.jpg
+*.jpeg
+*.pdf
+# Do NOT ignore pdfs inside docs/ (negation rule to ensure user manuals remain committed)
+!docs/**/*.pdf
+
+# OS specific files
+.DS_Store
+Thumbs.db
+Desktop.ini

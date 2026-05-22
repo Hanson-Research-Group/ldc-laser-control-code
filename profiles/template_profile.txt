@@ -1,0 +1,47 @@
+{
+  "T_ramp": 0.1,
+  "I_ramp": 0.5,
+  "T_OFF_Target": 22,
+  "channels": [
+    {
+      "T_Target": 22,
+      "I_Target": 0,
+      "Label": "Laser 1"
+    },
+    {
+      "T_Target": 22,
+      "I_Target": 0,
+      "Label": "Laser 2"
+    },
+    {
+      "T_Target": 22,
+      "I_Target": 0,
+      "Label": "Laser 3"
+    },
+    {
+      "T_Target": 22,
+      "I_Target": 0,
+      "Label": "Laser 4"
+    },
+    {
+      "T_Target": 22,
+      "I_Target": 0,
+      "Label": "Laser 5"
+    },
+    {
+      "T_Target": 22,
+      "I_Target": 0,
+      "Label": "Laser 6"
+    },
+    {
+      "T_Target": 22,
+      "I_Target": 0,
+      "Label": "Laser 7"
+    },
+    {
+      "T_Target": 22,
+      "I_Target": 0,
+      "Label": "Laser 8"
+    }
+  ]
+}
