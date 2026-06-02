@@ -160,7 +160,7 @@ class LDCControllerApp(ctk.CTk):
             # Custom styling color for live readouts
             if "Live" in header_text:
                 lbl.configure(text_color="#4af24a")
-            lbl.grid(row=0, column=col_idx, padx=3, pady=5, sticky="center")
+            lbl.grid(row=0, column=col_idx, padx=3, pady=5)
 
         # Store UI elements per channel
         self.ch_ui = []
@@ -173,12 +173,12 @@ class LDCControllerApp(ctk.CTk):
 
             # Ch. number
             lbl_ch = ctk.CTkLabel(self.grid_container, text=str(ch_idx), font=("Segoe UI", 10, "bold"))
-            lbl_ch.grid(row=row, column=0, padx=3, pady=3, sticky="center")
+            lbl_ch.grid(row=row, column=0, padx=3, pady=3)
 
             # Enable checkbox
             var_enable = tk.BooleanVar(value=False)
             chk_enable = ctk.CTkCheckBox(self.grid_container, text="", variable=var_enable, width=20, state="disabled")
-            chk_enable.grid(row=row, column=1, padx=3, pady=3, sticky="center")
+            chk_enable.grid(row=row, column=1, padx=3, pady=3)
 
             # Label field
             ent_label = ctk.CTkEntry(self.grid_container, placeholder_text=f"Laser {ch_idx}", width=110, state="disabled")
@@ -188,7 +188,7 @@ class LDCControllerApp(ctk.CTk):
 
             # LED Indicator Canvas
             led = LEDIndicator(self.grid_container, size=16, color="#444444")
-            led.grid(row=row, column=3, padx=3, pady=3, sticky="center")
+            led.grid(row=row, column=3, padx=3, pady=3)
 
             # Status Label
             lbl_status = ctk.CTkLabel(self.grid_container, text="Run Scan First", text_color="#888888", font=("Segoe UI", 10))
@@ -197,57 +197,57 @@ class LDCControllerApp(ctk.CTk):
             # Live TEC state field (read-only entry)
             ent_live_tec = ctk.CTkEntry(self.grid_container, width=65, state="disabled", font=("Segoe UI", 10, "bold"), justify="center")
             set_entry_val(ent_live_tec, "OFF")
-            ent_live_tec.grid(row=row, column=5, padx=3, pady=3, sticky="center")
+            ent_live_tec.grid(row=row, column=5, padx=3, pady=3)
 
             # Live LAS state field (read-only entry)
             ent_live_las = ctk.CTkEntry(self.grid_container, width=65, state="disabled", font=("Segoe UI", 10, "bold"), justify="center")
             set_entry_val(ent_live_las, "OFF")
-            ent_live_las.grid(row=row, column=6, padx=3, pady=3, sticky="center")
+            ent_live_las.grid(row=row, column=6, padx=3, pady=3)
 
             # Live Temp Readout
             ent_live_t = ctk.CTkEntry(self.grid_container, width=75, state="disabled", font=("Segoe UI", 10), justify="right")
             set_entry_val(ent_live_t, "0.0")
-            ent_live_t.grid(row=row, column=7, padx=3, pady=3, sticky="center")
+            ent_live_t.grid(row=row, column=7, padx=3, pady=3)
 
             # Live Current Readout
             ent_live_i = ctk.CTkEntry(self.grid_container, width=75, state="disabled", font=("Segoe UI", 10), justify="right")
             set_entry_val(ent_live_i, "0.0")
-            ent_live_i.grid(row=row, column=8, padx=3, pady=3, sticky="center")
+            ent_live_i.grid(row=row, column=8, padx=3, pady=3)
 
             # Target TEC Dropdown
             opt_tec = ctk.CTkOptionMenu(self.grid_container, values=["ON", "OFF"], width=75, state="disabled", command=self.mark_profile_unsaved)
             opt_tec.set("OFF")
-            opt_tec.grid(row=row, column=9, padx=3, pady=3, sticky="center")
+            opt_tec.grid(row=row, column=9, padx=3, pady=3)
 
             # Target LAS Dropdown
             opt_las = ctk.CTkOptionMenu(self.grid_container, values=["ON", "OFF"], width=75, state="disabled", command=self.mark_profile_unsaved)
             opt_las.set("OFF")
-            opt_las.grid(row=row, column=10, padx=3, pady=3, sticky="center")
+            opt_las.grid(row=row, column=10, padx=3, pady=3)
 
             # Target Temp Entry
             ent_target_t = ctk.CTkEntry(self.grid_container, width=75, state="disabled", justify="right")
             ent_target_t.insert(0, "22.0")
-            ent_target_t.grid(row=row, column=11, padx=3, pady=3, sticky="center")
+            ent_target_t.grid(row=row, column=11, padx=3, pady=3)
             ent_target_t.bind("<KeyRelease>", self.mark_profile_unsaved)
 
             # Max Temp Limit Label
             lbl_max_t = ctk.CTkLabel(self.grid_container, text="-", text_color="#666666", font=("Segoe UI", 10))
-            lbl_max_t.grid(row=row, column=12, padx=3, pady=3, sticky="center")
+            lbl_max_t.grid(row=row, column=12, padx=3, pady=3)
 
             # Target Current Entry
             ent_target_i = ctk.CTkEntry(self.grid_container, width=75, state="disabled", justify="right")
             ent_target_i.insert(0, "0.0")
-            ent_target_i.grid(row=row, column=13, padx=3, pady=3, sticky="center")
+            ent_target_i.grid(row=row, column=13, padx=3, pady=3)
             ent_target_i.bind("<KeyRelease>", self.mark_profile_unsaved)
 
             # Max Current Limit Label
             lbl_max_i = ctk.CTkLabel(self.grid_container, text="-", text_color="#666666", font=("Segoe UI", 10))
-            lbl_max_i.grid(row=row, column=14, padx=3, pady=3, sticky="center")
+            lbl_max_i.grid(row=row, column=14, padx=3, pady=3)
 
             # Run Channel Button
             btn_run_ch = ctk.CTkButton(self.grid_container, text="▶ Run Ch.", width=80, state="disabled", 
                                        command=lambda ch=ch_idx: self.execute_single_channel(ch))
-            btn_run_ch.grid(row=row, column=15, padx=3, pady=3, sticky="center")
+            btn_run_ch.grid(row=row, column=15, padx=3, pady=3)
 
             # Store mapping reference
             self.ch_ui.append({
