@@ -8,6 +8,7 @@ Developed by Zev Granowitz in collaboration with .
 import sys
 import os
 import json
+import math
 import time
 import threading
 import serial
@@ -764,7 +765,7 @@ class LDCControllerApp(ctk.CTk):
                     try:
                         t_val = float(t_val_str)
                     except:
-                        t_val = -999.0
+                        t_val = float('nan')
 
                     # Telemetry Snapshot
                     i_val_str = self.query_cmd("LAS:LDI?")
@@ -776,12 +777,12 @@ class LDCControllerApp(ctk.CTk):
                     tec_out_status = 0
                     las_out_status = 0
                     try:
-                        tec_out_status = int(self.query_cmd("TEC:OUT?"))
-                        las_out_status = int(self.query_cmd("LAS:OUT?"))
+                        tec_out_status = int(float(self.query_cmd("TEC:OUT?")))
+                        las_out_status = int(float(self.query_cmd("LAS:OUT?")))
                     except:
                         pass
 
-                    if not t_val_str or t_val < 0:
+                    if not t_val_str or math.isnan(t_val) or t_val < 0:
                         # Card exists but diode floating/negative voltage = no laser attached
                         self.after(0, self.mark_empty, k, "No Laser Attached")
                     else:
@@ -792,15 +793,25 @@ class LDCControllerApp(ctk.CTk):
                         max_t_str = self.query_cmd("TEC:LIM:THI?")
                         try:
                             max_t = float(max_t_str)
+                            if math.isnan(max_t):
+                                max_t = 99.0
                         except:
                             max_t = 99.0
 
                         max_i_str = self.query_cmd("LAS:LIM:I?")
-                        if not max_i_str or max_i_str == "NaN":
-                            max_i_str = self.query_cmd("LAS:LIM:LDI?")
                         try:
                             max_i = float(max_i_str)
                         except:
+                            max_i = float('nan')
+
+                        if math.isnan(max_i):
+                            max_i_str = self.query_cmd("LAS:LIM:LDI?")
+                            try:
+                                max_i = float(max_i_str)
+                            except:
+                                max_i = 500.0
+
+                        if math.isnan(max_i):
                             max_i = 500.0
 
                         # Restore modulation
@@ -984,20 +995,24 @@ class LDCControllerApp(ctk.CTk):
                         t_val_str = self.query_cmd("TEC:T?")
                         try:
                             t_val = float(t_val_str)
+                            if math.isnan(t_val):
+                                t_val = None
                         except:
                             t_val = None
 
                         i_val_str = self.query_cmd("LAS:LDI?")
                         try:
                             i_val = float(i_val_str)
+                            if math.isnan(i_val):
+                                i_val = None
                         except:
                             i_val = None
 
                         tec_stat = None
                         las_stat = None
                         try:
-                            tec_stat = int(self.query_cmd("TEC:OUT?"))
-                            las_stat = int(self.query_cmd("LAS:OUT?"))
+                            tec_stat = int(float(self.query_cmd("TEC:OUT?")))
+                            las_stat = int(float(self.query_cmd("LAS:OUT?")))
                         except:
                             pass
 
@@ -1270,10 +1285,10 @@ class LDCControllerApp(ctk.CTk):
                         h_t_lim = 80.0
 
                     # Safety Validation Checks
-                    if tec_on_off == "ON" and t_on_target > h_t_lim:
+                    if tec_on_off == "ON" and not math.isnan(h_t_lim) and t_on_target > h_t_lim:
                         raise ValueError(f"Target T ({t_on_target:.1f}°C) exceeds limit ({h_t_lim:.1f}°C)")
                     
-                    if las_on_off == "ON" and i_on_target > h_i_lim:
+                    if las_on_off == "ON" and not math.isnan(h_i_lim) and i_on_target > h_i_lim:
                         raise ValueError(f"Target I ({i_on_target:.1f}mA) exceeds limit ({h_i_lim:.1f}mA)")
 
                     if tec_on_off == "OFF" and las_on_off == "ON":
@@ -1349,8 +1364,15 @@ class LDCControllerApp(ctk.CTk):
         self.verify_hw_state("LAS:MOD?", 0, "Hardware failed to disable external modulation.")
 
         # 2. Read Current Status
-        tec_curr_status = int(self.query_cmd("TEC:OUT?"))
-        las_curr_status = int(self.query_cmd("LAS:OUT?"))
+        try:
+            tec_curr_status = int(float(self.query_cmd("TEC:OUT?")))
+        except:
+            tec_curr_status = -1
+
+        try:
+            las_curr_status = int(float(self.query_cmd("LAS:OUT?")))
+        except:
+            las_curr_status = -1
 
         # Safety Routing State Machine Matching MATLAB
         if tec_curr_status == 0 and las_curr_status == 0:
@@ -1462,7 +1484,7 @@ class LDCControllerApp(ctk.CTk):
         t_curr_str = self.query_cmd("TEC:T?")
         try:
             t_curr = float(t_curr_str)
-            if not tk.isnan(t_curr):
+            if not math.isnan(t_curr):
                 self.cmd_pause(f"TEC:T {t_curr:.2f}")
         except:
             pass
@@ -1478,7 +1500,7 @@ class LDCControllerApp(ctk.CTk):
             except:
                 self.safe_pause(0.15)
 
-        if t_curr is None:
+        if t_curr is None or math.isnan(t_curr):
             raise RuntimeError("Telemetry lost during initial Thermal readout.")
 
         if abs(t_curr - t_target) < 0.05:
@@ -1532,7 +1554,7 @@ class LDCControllerApp(ctk.CTk):
             except:
                 self.safe_pause(0.15)
 
-        if i_curr is None:
+        if i_curr is None or math.isnan(i_curr):
             raise RuntimeError("Telemetry lost during initial Laser readout.")
 
         if abs(i_curr - i_target) < 0.05:
@@ -1577,8 +1599,15 @@ class LDCControllerApp(ctk.CTk):
         idx = ch_num - 1
         ch = self.ch_ui[idx]
         
-        tec_stat = int(self.query_cmd("TEC:OUT?"))
-        las_stat = int(self.query_cmd("LAS:OUT?"))
+        try:
+            tec_stat = int(float(self.query_cmd("TEC:OUT?")))
+        except:
+            tec_stat = -1
+
+        try:
+            las_stat = int(float(self.query_cmd("LAS:OUT?")))
+        except:
+            las_stat = -1
 
         status_str = "Final Set: "
         if tec_stat == 1:
@@ -1610,9 +1639,10 @@ class LDCControllerApp(ctk.CTk):
         res = -1
         for retry in range(2):
             try:
-                res = int(self.query_cmd(cmd))
-                if res == expected_val:
+                res_val = float(self.query_cmd(cmd))
+                if not math.isnan(res_val) and int(res_val) == expected_val:
                     return
+                res = res_val
             except:
                 pass
             self.safe_pause(0.15)
