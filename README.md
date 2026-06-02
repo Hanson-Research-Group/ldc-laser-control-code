@@ -124,7 +124,23 @@ Experimental configurations are serialized into standard JSON text files, making
 
 ## 🛠️ Software Architecture
 
-The software utilizes a clean, object-oriented-like procedural GUI structure:
-*   **Main Thread & Event Loop**: Managed entirely via MATLAB's `uifigure` framework and `uigridlayout`.
-*   **Telemetry Loop**: Implemented with a non-blocking `timer` object which queries device state in short-timeout intervals to prevent UI freezing.
-*   **Hardware Abstraction Layer**: Fully handles SCPI commands (e.g. `TEC:T?`, `LAS:LDI`, `*CLS`) and directs operations cleanly whether routed to a physical serial object or the internal mockup state machine (`sim_state`).
+The software is available in two implementations sharing identical SCPI communication logic and safety algorithms:
+*   **MATLAB Implementation** (`src/LDC3908_ModularLaserDiodeControllerSoftware_v0_1_1.m`): Utilizes MATLAB's App Designer `uifigure` and an async background `timer` loop.
+*   **Python Port** (`src/main.py`): Built with `CustomTkinter` and features a fully thread-safe execution model. Telemetry queries and sequence ramps run on background worker threads, preventing UI lockups and connection timing jitters.
+
+---
+
+## 📦 Standalone Executable (Windows)
+
+A standalone Windows executable is compiled and distributed for systems without MATLAB installed.
+
+### Key Features of Python App:
+*   **Modern Interface**: Premium dark-mode GUI using CustomTkinter.
+*   **High-DPI Scaling**: Fits and resizes dynamically across diverse monitor sizes and screen resolutions.
+*   **Zero Dependencies**: Run the `.exe` directly; no runtime or compiler libraries required.
+
+### How to Run:
+1. Go to the **Releases** section of this repository.
+2. Download `LDC3908_ModularLaserDiodeControllerSoftware.exe` from the latest release.
+3. Run the executable on any Windows 10/11 PC.
+

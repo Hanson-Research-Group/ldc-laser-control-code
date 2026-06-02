@@ -38,3 +38,14 @@ New Text Document.txt
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Python / PyInstaller
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+.venv/
+venv/
+.pytest_cache/
+
