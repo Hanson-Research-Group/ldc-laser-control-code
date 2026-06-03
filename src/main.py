@@ -183,7 +183,7 @@ class LDCControllerApp(ctk.CTk):
         chan_panel.grid_columnconfigure(0, weight=1)
 
         # Title Label
-        ctk.CTkLabel(chan_panel, text="Individual Channel Configuration & Live Telemetry - v0.3.1", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        ctk.CTkLabel(chan_panel, text="Individual Channel Configuration & Live Telemetry", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, padx=10, pady=5, sticky="w")
 
         # Dynamic Grid Container
         self.grid_container = ctk.CTkFrame(chan_panel, fg_color="transparent")
