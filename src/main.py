@@ -51,10 +51,30 @@ class LEDIndicator(tk.Canvas):
 
     def draw_circle(self):
         self.delete("all")
-        padding = 1
-        # Draw anti-aliased look with outline and inner fill
-        self.create_oval(padding, padding, self.size - padding, self.size - padding, 
-                         fill=self.color, outline="#444444", width=1)
+        # Generate a beautiful soft border by slightly darkening the color
+        border_color = self.color
+        if self.color.startswith("#"):
+            try:
+                r = int(self.color[1:3], 16)
+                g = int(self.color[3:5], 16)
+                b = int(self.color[5:7], 16)
+                r_border = max(0, int(r * 0.7))
+                g_border = max(0, int(g * 0.7))
+                b_border = max(0, int(b * 0.7))
+                border_color = f"#{r_border:02x}{g_border:02x}{b_border:02x}"
+            except:
+                pass
+        
+        # Outer ring
+        self.create_oval(1, 1, self.size - 1, self.size - 1, 
+                         fill=self.color, outline=border_color, width=1.5)
+        
+        # Specular/highlight gloss: a soft white reflection dot at top-left
+        if self.color not in ["#444444", "#cccccc", "#b0bec5"]:
+            r_glow = self.size * 0.2
+            self.create_oval(self.size * 0.25, self.size * 0.25, 
+                             self.size * 0.25 + r_glow, self.size * 0.25 + r_glow,
+                             fill="#ffffff", outline="")
 
     def set_color(self, color):
         self.color = color
@@ -66,7 +86,7 @@ class LDCControllerApp(ctk.CTk):
         super().__init__()
 
         # --- Configure Main Window ---
-        self.title("LDC-3908 Modular Laser Diode Controller Software v0.2.0")
+        self.title("LDC-3908 Modular Laser Diode Controller Software v0.3.1")
         self.geometry("1450x850")
         self.minsize(1200, 700)
         
@@ -234,12 +254,14 @@ class LDCControllerApp(ctk.CTk):
             lbl_status.grid(row=row, column=4, padx=3, pady=3, sticky="w")
 
             # Live TEC state field (read-only entry)
-            ent_live_tec = ctk.CTkEntry(self.grid_container, width=65, state="disabled", font=("Segoe UI", 10, "bold"), justify="center")
+            ent_live_tec = ctk.CTkEntry(self.grid_container, width=65, state="disabled", font=("Segoe UI", 10, "bold"), justify="center",
+                                       fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
             set_entry_val(ent_live_tec, "OFF")
             ent_live_tec.grid(row=row, column=5, padx=3, pady=3)
 
             # Live LAS state field (read-only entry)
-            ent_live_las = ctk.CTkEntry(self.grid_container, width=65, state="disabled", font=("Segoe UI", 10, "bold"), justify="center")
+            ent_live_las = ctk.CTkEntry(self.grid_container, width=65, state="disabled", font=("Segoe UI", 10, "bold"), justify="center",
+                                       fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
             set_entry_val(ent_live_las, "OFF")
             ent_live_las.grid(row=row, column=6, padx=3, pady=3)
 
@@ -324,7 +346,7 @@ class LDCControllerApp(ctk.CTk):
         self.btn_master_on.grid(row=master_row_1, column=7, columnspan=2, padx=3, pady=3, sticky="ew")
 
         self.btn_master_off = ctk.CTkButton(self.grid_container, text="MASTER All OFF", font=("Segoe UI", 10, "bold"),
-                                             fg_color="#d32f2f", hover_color="#c62828", text_color="white",
+                                             fg_color="#c62828", hover_color="#b71c1c", text_color="white",
                                              state="disabled", command=lambda: self.set_all_systems("OFF"))
         self.btn_master_off.grid(row=master_row_2, column=7, columnspan=2, padx=3, pady=3, sticky="ew")
 
@@ -335,7 +357,7 @@ class LDCControllerApp(ctk.CTk):
         self.btn_tec_on.grid(row=master_row_1, column=9, padx=3, pady=3, sticky="ew")
 
         self.btn_tec_off = ctk.CTkButton(self.grid_container, text="TEC All OFF", font=("Segoe UI", 9, "bold"),
-                                          fg_color="#d32f2f", hover_color="#c62828", text_color="white",
+                                          fg_color="#c62828", hover_color="#b71c1c", text_color="white",
                                           state="disabled", command=lambda: self.set_all_dropdowns("TEC", "OFF"))
         self.btn_tec_off.grid(row=master_row_2, column=9, padx=3, pady=3, sticky="ew")
 
@@ -346,7 +368,7 @@ class LDCControllerApp(ctk.CTk):
         self.btn_las_on.grid(row=master_row_1, column=10, padx=3, pady=3, sticky="ew")
 
         self.btn_las_off = ctk.CTkButton(self.grid_container, text="LAS All OFF", font=("Segoe UI", 9, "bold"),
-                                          fg_color="#d32f2f", hover_color="#c62828", text_color="white",
+                                          fg_color="#c62828", hover_color="#b71c1c", text_color="white",
                                           state="disabled", command=lambda: self.set_all_dropdowns("LAS", "OFF"))
         self.btn_las_off.grid(row=master_row_2, column=10, padx=3, pady=3, sticky="ew")
 
@@ -399,16 +421,16 @@ class LDCControllerApp(ctk.CTk):
         self.lbl_profile.grid(row=2, column=4, padx=15, pady=10, sticky="w")
 
         # Execution actions on the right side
-        self.btn_exec_all = ctk.CTkButton(bot_panel, text="▶ RUN ALL", font=("Segoe UI", 12, "bold"), fg_color="#2ca02c", hover_color="#228022",
+        self.btn_exec_all = ctk.CTkButton(bot_panel, text="▶ RUN ALL", font=("Segoe UI", 12, "bold"), fg_color="#2e7d32", hover_color="#1b5e20",
                                            text_color="white", state="disabled", width=170, height=60, command=self.execute_all)
         self.btn_exec_all.grid(row=0, column=6, rowspan=2, padx=10, pady=10, sticky="nsew")
 
-        self.btn_stop = ctk.CTkButton(bot_panel, text="⏹ CANCEL RUN (Safe)", font=("Segoe UI", 11, "bold"), fg_color="#d32f2f", hover_color="#c62828",
+        self.btn_stop = ctk.CTkButton(bot_panel, text="⏹ CANCEL RUN (Safe)", font=("Segoe UI", 11, "bold"), fg_color="#c62828", hover_color="#b71c1c",
                                        text_color="white", state="disabled", width=170, command=self.stop_execution)
         self.btn_stop.grid(row=2, column=6, padx=10, pady=10, sticky="nsew")
 
         # Emergency Laser Off
-        self.btn_emerg = ctk.CTkButton(bot_panel, text="⚠\nEMO\nOFF", font=("Segoe UI", 9, "bold"), fg_color="#d32f2f", hover_color="#b71c1c",
+        self.btn_emerg = ctk.CTkButton(bot_panel, text="⚠\nEMO\nOFF", font=("Segoe UI", 9, "bold"), fg_color="#c62828", hover_color="#b71c1c",
                                         text_color="white", state="disabled", width=60, command=self.emergency_las_off)
         self.btn_emerg.grid(row=0, column=5, rowspan=3, padx=10, pady=10, sticky="nsew")
 
@@ -431,7 +453,7 @@ class LDCControllerApp(ctk.CTk):
         if valid:
             widget.configure(border_color=("#979da2", "#565b5e"))  # default
         else:
-            widget.configure(border_color="#ff5555")  # red highlight
+            widget.configure(border_color="#c62828")  # red highlight
         return valid
 
     # ----------------------------------------------------
@@ -440,7 +462,7 @@ class LDCControllerApp(ctk.CTk):
     def mark_profile_unsaved(self, *args):
         text = self.lbl_profile.cget("text")
         if not text.startswith("* "):
-            self.lbl_profile.configure(text=f"* {text}", text_color="#ef6c00")
+            self.lbl_profile.configure(text=f"* {text}", text_color="#f57c00")
 
     def refresh_ports(self):
         self.avail_ports = [port.device for port in serial.tools.list_ports.comports()]
@@ -597,7 +619,7 @@ class LDCControllerApp(ctk.CTk):
         # Don't permit disconnect during sequence execution
         if self.is_executing:
             if self.is_stop_requested:
-                self.status_label.configure(text="Status: WAITING for halt...", text_color="#ef6c00")
+                self.status_label.configure(text="Status: WAITING for halt...", text_color="#f57c00")
             else:
                 self.status_label.configure(text="Status: PRESS STOP BEFORE DISCONNECTING!", text_color="#c62828")
             return
@@ -636,7 +658,7 @@ class LDCControllerApp(ctk.CTk):
 
         if self.is_simulated:
             self.status_label.configure(text="Status: Demo Mode Active", text_color="#7b1fa2")
-            self.btn_connect.configure(text="Disconnect", fg_color="#d32f2f")
+            self.btn_connect.configure(text="Disconnect", fg_color="#c62828", hover_color="#b71c1c")
             self.com_dropdown.configure(state="disabled")
             self.btn_scan.configure(state="normal")
             self.btn_clear_faults.configure(state="normal")
@@ -646,7 +668,7 @@ class LDCControllerApp(ctk.CTk):
             self.ser = serial.Serial(port_choice, baudrate=9600, timeout=5.0)
             self.ser.reset_input_buffer()
             self.status_label.configure(text="Status: Connected (Ready)", text_color="#2e7d32")
-            self.btn_connect.configure(text="Disconnect", fg_color="#d32f2f")
+            self.btn_connect.configure(text="Disconnect", fg_color="#c62828", hover_color="#b71c1c")
             self.com_dropdown.configure(state="disabled")
             self.btn_scan.configure(state="normal")
             self.btn_clear_faults.configure(state="normal")
@@ -792,9 +814,10 @@ class LDCControllerApp(ctk.CTk):
     def start_channel_scan(self):
         self.is_scanning = True
         self.btn_scan.configure(state="disabled")
+        self.btn_connect.configure(state="disabled")
         self.btn_exec_all.configure(state="disabled")
         self.lock_ui("disabled")
-        self.status_label.configure(text="Status: Scanning active hardware...", text_color="#ef6c00")
+        self.status_label.configure(text="Status: Scanning active hardware...", text_color="#f57c00")
         
         # Run scan loop in a background thread to prevent UI freezing
         threading.Thread(target=self.run_channel_scan, daemon=True).start()
@@ -890,8 +913,8 @@ class LDCControllerApp(ctk.CTk):
                         if math.isnan(max_i):
                             max_i = 500.0
 
-                        # Restore modulation
-                        self.send_cmd("LAS:MOD 1")
+                        # Restore modulation with a safety settling delay
+                        self.cmd_pause("LAS:MOD 1")
 
                         # Dispatch updates to UI thread safely
                         self.after(0, self.update_channel_after_scan, k, t_val, i_val, tec_out_status, las_out_status, max_t, max_i, has_hw_err, hw_err_str)
@@ -931,35 +954,35 @@ class LDCControllerApp(ctk.CTk):
 
         # Set live output status boxes visually
         if tec_out == 1:
-            ch["live_tec"].configure(fg_color="#2ca02c", text_color="white")
+            ch["live_tec"].configure(fg_color="#2e7d32", text_color="white", text_color_disabled="white")
             set_entry_val(ch["live_tec"], "ON")
         else:
-            ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
+            ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
             set_entry_val(ch["live_tec"], "OFF")
 
         if las_out == 1:
-            ch["live_las"].configure(fg_color="#2ca02c", text_color="white")
+            ch["live_las"].configure(fg_color="#2e7d32", text_color="white", text_color_disabled="white")
             set_entry_val(ch["live_las"], "ON")
         else:
-            ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
+            ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
             set_entry_val(ch["live_las"], "OFF")
 
         # Update LED colors and status text
         if has_hw_err:
             ch["status"].configure(text=f"FAULT: {hw_err_str}", text_color="#c62828")
-            ch["led"].set_color("#ff0000")
+            ch["led"].set_color("#c62828")
         elif tec_out == 1 and las_out == 1:
-            ch["status"].configure(text="TEC ON, LAS ON", text_color="#ef6c00")
-            ch["led"].set_color("#2ca02c")
+            ch["status"].configure(text="TEC ON, LAS ON", text_color="#f57c00")
+            ch["led"].set_color("#2e7d32")
         elif tec_out == 1:
-            ch["status"].configure(text="TEC ON, LAS OFF", text_color="#ef6c00")
-            ch["led"].set_color("#ffdd00")
+            ch["status"].configure(text="TEC ON, LAS OFF", text_color="#f57c00")
+            ch["led"].set_color("#f57c00")
         elif las_out == 1:
             ch["status"].configure(text="WARNING: LAS ON, TEC OFF", text_color="#c62828")
-            ch["led"].set_color("#ff0000")
+            ch["led"].set_color("#c62828")
         else:
             ch["status"].configure(text="Ready", text_color="#2e7d32")
-            ch["led"].set_color("#2ca02c")
+            ch["led"].set_color("#2e7d32")
 
     def finish_channel_scan(self, cards_found):
         self.is_scanning = False
@@ -968,11 +991,12 @@ class LDCControllerApp(ctk.CTk):
             return
 
         if cards_found == 0:
-            self.status_label.configure(text="WARNING: 0 slots responded. Check connection & power.", text_color="#ef6c00")
+            self.status_label.configure(text="WARNING: 0 slots responded. Check connection & power.", text_color="#f57c00")
         else:
             self.status_label.configure(text="Status: Scan Complete & Matched", text_color="#2e7d32")
 
         self.lock_ui("normal")
+        self.btn_connect.configure(state="normal")
 
         # Start Telemetry thread if not active
         if not self.telemetry_active:
@@ -986,12 +1010,12 @@ class LDCControllerApp(ctk.CTk):
         ch["enable_var"].set(False)
         ch["laser_label"].configure(state="disabled")
         
-        ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
+        ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
         set_entry_val(ch["live_tec"], "OFF")
-        ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
+        ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
         set_entry_val(ch["live_las"], "OFF")
 
-        ch["status"].configure(text=reason, text_color="#666666")
+        ch["status"].configure(text=reason, text_color="#78909c")
         ch["led"].set_color("#444444")
         set_entry_val(ch["cur_t"], "0.0")
         set_entry_val(ch["cur_i"], "0.0")
@@ -1132,18 +1156,18 @@ class LDCControllerApp(ctk.CTk):
 
             if tec_stat is not None:
                 if tec_stat == 1:
-                    ch["live_tec"].configure(fg_color="#2ca02c", text_color="white")
+                    ch["live_tec"].configure(fg_color="#2e7d32", text_color="white", text_color_disabled="white")
                     set_entry_val(ch["live_tec"], "ON")
                 else:
-                    ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
+                    ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
                     set_entry_val(ch["live_tec"], "OFF")
 
             if las_stat is not None:
                 if las_stat == 1:
-                    ch["live_las"].configure(fg_color="#2ca02c", text_color="white")
+                    ch["live_las"].configure(fg_color="#2e7d32", text_color="white", text_color_disabled="white")
                     set_entry_val(ch["live_las"], "ON")
                 else:
-                    ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
+                    ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
                     set_entry_val(ch["live_las"], "OFF")
         except tk.TclError:
             pass
@@ -1220,10 +1244,10 @@ class LDCControllerApp(ctk.CTk):
 
     def update_channel_emergency_off(self, idx):
         ch = self.ch_ui[idx]
-        ch["live_las"].configure(fg_color="#3a3a3a", text_color="#888888")
+        ch["live_las"].configure(fg_color="#3a3a3a", text_color="#888888", text_color_disabled="#888888")
         set_entry_val(ch["live_las"], "OFF")
         ch["status"].configure(text="EMERGENCY OFF: Current Cut", text_color="#c62828")
-        ch["led"].set_color("#ff0000")
+        ch["led"].set_color("#c62828")
 
     def finish_emergency_las_off(self):
         self.status_label.configure(text="Status: EMERGENCY LASER SHUTDOWN TRIGGERED.", text_color="#ff0000")
@@ -1232,7 +1256,7 @@ class LDCControllerApp(ctk.CTk):
 
     def clear_faults(self):
         self.lock_ui("disabled")
-        self.status_label.configure(text="Status: Clearing chassis faults...", text_color="#ef6c00")
+        self.status_label.configure(text="Status: Clearing chassis faults...", text_color="#f57c00")
         threading.Thread(target=self.run_clear_faults, daemon=True).start()
 
     def run_clear_faults(self):
@@ -1761,9 +1785,9 @@ class LDCControllerApp(ctk.CTk):
             self.after(0, self.update_live_out_ui, idx, "LAS", "OFF")
 
         self.after(0, self.update_channel_status, idx, status_str, "#2e7d32")
-        self.after(0, ch["led"].set_color, "#2ca02c")
+        self.after(0, ch["led"].set_color, "#2e7d32")
 
-        self.send_cmd("LAS:MOD 1")
+        self.cmd_pause("LAS:MOD 1")
 
     # --- Verification & Error Helpers (Thread-safe) ---
     def safe_pause(self, t):
@@ -1834,17 +1858,17 @@ class LDCControllerApp(ctk.CTk):
         ch = self.ch_ui[idx]
         if type_str == "TEC":
             if state_str == "ON":
-                ch["live_tec"].configure(fg_color="#2ca02c", text_color="white")
+                ch["live_tec"].configure(fg_color="#2e7d32", text_color="white", text_color_disabled="white")
                 set_entry_val(ch["live_tec"], "ON")
             else:
-                ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
+                ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
                 set_entry_val(ch["live_tec"], "OFF")
         elif type_str == "LAS":
             if state_str == "ON":
-                ch["live_las"].configure(fg_color="#2ca02c", text_color="white")
+                ch["live_las"].configure(fg_color="#2e7d32", text_color="white", text_color_disabled="white")
                 set_entry_val(ch["live_las"], "ON")
             else:
-                ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
+                ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
                 set_entry_val(ch["live_las"], "OFF")
 
     def update_eta(self):
@@ -1876,7 +1900,7 @@ class LDCControllerApp(ctk.CTk):
 
         if self.is_scanning:
             self.is_closing = True
-            self.status_label.configure(text="Status: Aborting scan to close...", text_color="#ff9f43")
+            self.status_label.configure(text="Status: Aborting scan to close...", text_color="#f57c00")
             return
 
         # Check unsaved profile
