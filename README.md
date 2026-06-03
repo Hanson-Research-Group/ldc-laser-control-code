@@ -49,8 +49,10 @@ ldc-laser-control-code/
 │   ├── AirXenonIonizatioCampaign_LaserSetpoints4.txt
 │   └── template_profile.txt
 ├── src/                       # Main source code directory
-│   └── LDC3908_ModularLaserDiodeControllerSoftware_v0_1_1.m  # GUI App entry point
-├── .gitignore                 # MATLAB-specific git ignore file
+│   ├── main.py                    # Main Python GUI App entry point
+│   ├── laser_controller_icon.ico  # Application icon (.ico)
+│   └── laser_controller_icon.png  # Application icon (.png)
+├── .gitignore                 # Python-specific git ignore file
 └── README.md                  # Beautiful, highly professional user guide
 ```
 
@@ -68,7 +70,7 @@ The mainframe communicates over a standard RS-232 serial interface. Verify the f
 
 ### Connecting to the Host
 1. Connect the Newport LDC-3908 RS-232 port to the host PC using a null-modem cable or USB-to-RS232 adapter.
-2. Open MATLAB and run `LDC3908_ModularLaserDiodeControllerSoftware_v0_1_1`.
+2. Run the application by executing `python src/main.py` from the project root.
 3. In the **COM Port** dropdown, select the corresponding serial port detected on your Windows USB stack (e.g., `COM3`).
 4. Click **Connect**. If the physical hardware is unavailable, select **Demo Simulator** to explore the software's capabilities safely in virtual space.
 
@@ -124,17 +126,15 @@ Experimental configurations are serialized into standard JSON text files, making
 
 ## 🛠️ Software Architecture
 
-The software is available in two implementations sharing identical SCPI communication logic and safety algorithms:
-*   **MATLAB Implementation** (`src/LDC3908_ModularLaserDiodeControllerSoftware_v0_1_1.m`): Utilizes MATLAB's App Designer `uifigure` and an async background `timer` loop.
-*   **Python Port** (`src/main.py`): Built with `CustomTkinter` and features a fully thread-safe execution model. Telemetry queries and sequence ramps run on background worker threads, preventing UI lockups and connection timing jitters.
+The software is built in Python using `CustomTkinter` for a modern GUI. It features a fully thread-safe execution model. Telemetry queries and sequence ramps run on background worker threads, preventing UI lockups and connection timing jitters.
 
 ---
 
 ## 📦 Standalone Executable (Windows)
 
-A standalone Windows executable is compiled and distributed for systems without MATLAB installed.
+A standalone Windows executable is compiled and distributed using PyInstaller for systems without Python installed, or for convenient deployment.
 
-### Key Features of Python App:
+### Key Features:
 *   **Modern Interface**: Premium dark-mode GUI using CustomTkinter.
 *   **High-DPI Scaling**: Fits and resizes dynamically across diverse monitor sizes and screen resolutions.
 *   **Zero Dependencies**: Run the `.exe` directly; no runtime or compiler libraries required.
