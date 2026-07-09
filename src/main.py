@@ -9,6 +9,7 @@ import sys
 import os
 import json
 import math
+import re
 import time
 import threading
 import serial
@@ -92,6 +93,7 @@ class LDCControllerApp(ctk.CTk):
         self.is_executing = False
         self.is_scanning = False
         self.is_stop_requested = False
+        self.is_emo_requested = False
         self.is_simulated = False
         self.active_profile_path = ""
         self.total_estimated_time = 0.0
@@ -649,7 +651,7 @@ class LDCControllerApp(ctk.CTk):
 
         self.is_simulated = False
         self.status_label.configure(text="Status: Disconnected", text_color="#c62828")
-        self.btn_connect.configure(text="Connect", fg_color=None)
+        self.btn_connect.configure(text="Connect", fg_color="#1976D2")
         self.com_dropdown.configure(state="normal")
         self.btn_scan.configure(state="disabled")
         self.btn_clear_faults.configure(state="disabled")
@@ -868,7 +870,13 @@ class LDCControllerApp(ctk.CTk):
                         pass
 
                     if not t_val_str or math.isnan(t_val) or t_val < 0:
-                        # Card exists but diode floating/negative voltage = no laser attached
+                        # Card exists but diode floating/negative voltage = no laser attached.
+                        # NOTE for future maintainers: this treats ANY sub-zero thermistor
+                        # reading as "no diode present". That is valid for this lab's use case
+                        # (these lasers always operate above 0 °C, so a negative reading only
+                        # ever means a floating/open input), but it is NOT safe for cryogenic
+                        # or sub-zero setups — a genuinely cold diode would be misclassified as
+                        # absent and locked out. Revisit this sentinel if that ever changes.
                         self.after(0, self.mark_empty, k, "No Laser Attached")
                     else:
                         # Valid card found! Query errors
@@ -1204,12 +1212,30 @@ class LDCControllerApp(ctk.CTk):
             self.btn_emerg.configure(state="normal")
             return
 
+        # Break any in-progress ramp immediately so the laser stops advancing.
+        self.is_stop_requested = True
+        self.is_emo_requested = True
+
+        if self.is_executing:
+            # A sequence is running and owns the serial lock for the entire duration
+            # of each channel's ramp. Spawning a competing EMO thread here would just
+            # block on that lock until the whole ramp finished (the previous bug: EMO
+            # could not fire during the most dangerous moment of a run). Instead we
+            # flag it: setting is_stop_requested aborts the ramp within a fraction of
+            # a second (via safe_pause), and run_sequence_thread's cleanup performs
+            # the laser cutoff itself once the serial lock is free.
+            self.status_label.configure(text="Status: EMERGENCY OFF — cutting laser...", text_color="#ff0000")
+            return
+
+        # Idle (laser holding but not ramping): the serial lock is free, so cut now.
         # P1 #6: EMO thread must NOT be a daemon — laser-off commands must complete
         # even if the main thread is exiting. Track it for join-on-close.
-        self._emo_thread = threading.Thread(target=self.run_emergency_las_off_thread, daemon=False)
+        self._emo_thread = threading.Thread(target=self._perform_emergency_shutdown, daemon=False)
         self._emo_thread.start()
 
-    def run_emergency_las_off_thread(self):
+    def _perform_emergency_shutdown(self):
+        """Cut LAS output on every active channel. Caller must ensure the serial
+        lock is free (either idle, or the sequence thread has released it)."""
         with self.serial_lock:
             for k in range(self.num_channels):
                 # P2 #7: Abort gracefully if app is closing (Removed: EMO must complete)
@@ -1230,7 +1256,7 @@ class LDCControllerApp(ctk.CTk):
 
     def update_channel_emergency_off(self, idx):
         ch = self.ch_ui[idx]
-        ch["live_las"].configure(fg_color="#3a3a3a", text_color="#888888")
+        ch["live_las"].configure(fg_color=("#e0e0e0", "#3a3a3a"), text_color=("black", "#888888"))
         set_entry_val(ch["live_las"], "OFF")
         ch["status"].configure(text="EMERGENCY OFF: Current Cut", text_color="#c62828")
         ch["led"].set_color("#c62828")
@@ -1305,6 +1331,7 @@ class LDCControllerApp(ctk.CTk):
         # Prepare state variables
         self.is_executing = True
         self.is_stop_requested = False
+        self.is_emo_requested = False
         self.status_label.configure(text="Status: Sequence Running...", text_color="#2e7d32")
 
         self.lock_ui("disabled")
@@ -1448,7 +1475,13 @@ class LDCControllerApp(ctk.CTk):
         self.after(0, self.lock_ui, "normal")
         self.after(0, lambda: self.btn_stop.configure(state="disabled"))
 
-        if self.is_stop_requested:
+        if self.is_emo_requested:
+            # EMO was requested mid-run: the ramp has aborted and we've now left the
+            # serial-lock block, so the lock is free. Cut every active laser here in
+            # the sequence thread (finish_emergency_las_off sets the final status).
+            self._perform_emergency_shutdown()
+            self.is_emo_requested = False
+        elif self.is_stop_requested:
             self.after(0, lambda: self.status_label.configure(text="Status: Hardware Halted & Pinned.", text_color="#c62828"))
         else:
             self.after(0, lambda: self.status_label.configure(text="Status: Sequence Complete & Settled.", text_color="#2e7d32"))
@@ -1606,8 +1639,13 @@ class LDCControllerApp(ctk.CTk):
                 self.after(0, self.update_live_out_ui, idx, "LAS", "OFF")
                 raise RuntimeError(f"CRITICAL FAULT CH {ch_num}: Laser ON while TEC OFF. Ramped down laser safely.")
             else:
-                self.after(0, self.update_channel_status, idx, "Warning Status Collision. Skipping.", "#c62828")
-                return
+                # Reached only when TEC/LAS output status could not be determined
+                # (a query returned -1 / unparseable, or a value outside {0,1}).
+                # Fail loud rather than silently skipping the channel: for laser
+                # safety we must not proceed with an unknown output state.
+                raise RuntimeError(
+                    f"Could not read TEC/LAS output state for Ch {ch_num} "
+                    f"(TEC={tec_curr_status}, LAS={las_curr_status}). Aborting for safety.")
 
         if not self.is_stop_requested:
             self.final_check(ch_num)
@@ -1641,15 +1679,31 @@ class LDCControllerApp(ctk.CTk):
 
         t_set = t_curr
         t_start = t_curr
-        step = ((1 if t_target > t_curr else -1) * abs(t_ramp) * 0.5)
+        # Time-based stepping: advance the setpoint by (rate * actual elapsed time)
+        # each iteration instead of a fixed 0.5 s-worth of movement. The old code
+        # added abs(t_ramp)*0.5 per loop while assuming every loop took exactly
+        # 0.5 s, but each iteration also spends ~0.2-0.3 s inside query_cmd, so the
+        # true ramp ran ~30% slower than the requested °C/s (and update_eta was
+        # correspondingly optimistic). Measuring real elapsed time makes the
+        # physical ramp rate — and the ETA — match the setting.
+        direction = 1 if t_target > t_curr else -1
+        NOMINAL_PERIOD = 0.5  # priming value so the first step isn't zero-length
+        last_tick = time.time() - NOMINAL_PERIOD
 
         t_fail_count = 0
         while abs(t_set - t_target) > 0.01:
             if self.is_stop_requested:
                 raise RuntimeError("HALT")
 
-            t_set += step
-            if (step > 0 and t_set > t_target) or (step < 0 and t_set < t_target):
+            now = time.time()
+            dt = now - last_tick
+            last_tick = now
+            # Clamp dt so a stalled serial read (up to the port timeout) can't make
+            # the setpoint jump by a large, unsafe increment in a single step.
+            dt = max(0.0, min(dt, 1.0))
+
+            t_set += direction * abs(t_ramp) * dt
+            if (direction > 0 and t_set > t_target) or (direction < 0 and t_set < t_target):
                 t_set = t_target
 
             self.send_cmd(f"TEC:T {t_set:.2f}")
@@ -1702,15 +1756,27 @@ class LDCControllerApp(ctk.CTk):
 
         i_set = i_curr
         i_start = i_curr
-        step = ((1 if i_target > i_curr else -1) * abs(i_ramp) * 0.5)
+        # Time-based stepping (see ramp_temp for the full rationale): advance the
+        # current setpoint by (rate * actual elapsed time) so the physical mA/s
+        # ramp rate and the ETA match the requested value instead of running slow.
+        direction = 1 if i_target > i_curr else -1
+        NOMINAL_PERIOD = 0.5  # priming value so the first step isn't zero-length
+        last_tick = time.time() - NOMINAL_PERIOD
 
         i_fail_count = 0
         while abs(i_set - i_target) > 0.01:
             if self.is_stop_requested:
                 raise RuntimeError("HALT")
 
-            i_set += step
-            if (step > 0 and i_set > i_target) or (step < 0 and i_set < i_target):
+            now = time.time()
+            dt = now - last_tick
+            last_tick = now
+            # Clamp dt so a stalled serial read (up to the port timeout) can't make
+            # the setpoint jump by a large, unsafe increment in a single step.
+            dt = max(0.0, min(dt, 1.0))
+
+            i_set += direction * abs(i_ramp) * dt
+            if (direction > 0 and i_set > i_target) or (direction < 0 and i_set < i_target):
                 i_set = i_target
 
             self.send_cmd(f"LAS:LDI {i_set:.2f}")
@@ -1795,43 +1861,52 @@ class LDCControllerApp(ctk.CTk):
         raise RuntimeError(f"{err_msg} (Expected {expected_val}, Got {res})")
 
     def check_controller_errors_threadsafe(self, ch_num):
+        # MODERR? returns a list of numeric module/command error codes (e.g. "0",
+        # "504", or a comma/space separated list). Parse out the individual integer
+        # tokens and compare exactly, rather than doing substring matches on the raw
+        # string — the old `"504" in err_str` test would false-match codes like
+        # "5040" or "1504" and misreport faults.
+        KNOWN = ["501", "504", "503", "505", "508", "511", "404", "407"]
         err_str = ""
+        codes = []
         for retry in range(3):
             self.send_cmd(f"CHAN {ch_num}")
             time.sleep(0.1)
-            
+
             if not self.is_simulated and self.ser:
                 self.ser.reset_input_buffer()
-            
+
             self.send_cmd("MODERR?")
             time.sleep(0.15)
             err_resp = self.read_cmd()
             err_str = err_resp.strip()
+            codes = re.findall(r"\d+", err_str)
 
-            if not err_str or err_str in ["0", "000", "00"]:
+            # No error: nothing returned, or every returned code is zero.
+            if not codes or all(int(c) == 0 for c in codes):
                 return False, ""
 
-            # Check for recognized hardware error strings
-            if any(code in err_str for code in ["501", "504", "503", "505", "508", "511", "404", "407"]):
+            # Stop retrying once we see a recognized fault code.
+            if any(c in codes for c in KNOWN):
                 break
             time.sleep(0.2)
 
-        if not err_str or err_str in ["0", "000", "00"]:
+        if not codes or all(int(c) == 0 for c in codes):
             return False, ""
 
-        if "501" in err_str:
+        if "501" in codes:
             return True, f"Interlock Error (E501): Key switch is off. [{err_str}]"
-        elif "504" in err_str:
+        elif "504" in codes:
             return True, f"Current Limit Reached (E504). [{err_str}]"
-        elif "503" in err_str:
+        elif "503" in codes:
             return True, f"Voltage Limit Reached / Open Circuit (E503). [{err_str}]"
-        elif "505" in err_str:
+        elif "505" in codes:
             return True, f"Voltage Limit Warning (E505). [{err_str}]"
-        elif "508" in err_str:
+        elif "508" in codes:
             return True, f"TEC Off Status Forced LAS Off (E508). [{err_str}]"
-        elif "511" in err_str:
+        elif "511" in codes:
             return True, f"Hardware Error (E511). [{err_str}]"
-        elif "404" in err_str or "407" in err_str:
+        elif "404" in codes or "407" in codes:
             return True, f"Temperature Limit Error. [{err_str}]"
         else:
             return True, f"Module Error Code: {err_str}"
