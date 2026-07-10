@@ -126,7 +126,19 @@ Experimental configurations are serialized into standard JSON text files, making
 
 ## 🛠️ Software Architecture
 
-The software is built in Python using `CustomTkinter` for a modern GUI. It features a fully thread-safe execution model. Telemetry queries and sequence ramps run on background worker threads, preventing UI lockups and connection timing jitters.
+The hardware/protocol and safety-critical control logic live in a UI-agnostic core, independent of any GUI toolkit:
+
+*   `laser_controller.py` — serial I/O, the Demo Simulator, and safety helpers (read-back verification, cooperative halt, `MODERR?` parsing).
+*   `sequencer.py` — the per-channel safety state machine and the temperature/current ramps. It drives the controller and reports back through a `SequenceEvents` sink instead of touching any widgets.
+
+This core is exercised by head-less unit tests (`test_laser_controller.py`, `test_sequencer.py`) that run with no display.
+
+Two front-ends sit on top of the same core:
+
+*   **`main.py`** — the current `CustomTkinter` GUI (light/dark toggle, responsive Table/Cards channel views, auto-hide of unused channels).
+*   **`main_qt.py`** — a **PySide6 / Qt** front-end (migration in progress). Requires `pip install PySide6`. Worker-thread updates reach the GUI through Qt signals. Run with `python src/main_qt.py`; smoke-tested head-less by `test_qt.py`.
+
+Both keep telemetry queries and sequence ramps on background worker threads, preventing UI lockups and connection timing jitters.
 
 ---
 
