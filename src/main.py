@@ -9,7 +9,6 @@ import sys
 import os
 import json
 import math
-import re
 import time
 import threading
 import serial
@@ -17,6 +16,8 @@ import serial.tools.list_ports
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+from laser_controller import LaserController
 
 import ctypes
 try:
@@ -86,37 +87,26 @@ class LDCControllerApp(ctk.CTk):
         except:
             pass
 
-        # --- Shared Application State Variables ---
-        self.ser = None
-        self.serial_lock = threading.Lock()
         self.num_channels = 8
+
+        # --- Control Core ---
+        # All hardware I/O, the Demo Simulator, and the shared control flags live
+        # in the UI-agnostic LaserController (laser_controller.py). The GUI accesses
+        # them through the proxy properties / delegator methods defined below.
+        self.ctl = LaserController(num_channels=self.num_channels)
+
+        # --- Application (UI) State Variables ---
         self.is_executing = False
         self.is_scanning = False
-        self.is_stop_requested = False
-        self.is_emo_requested = False
-        self.is_simulated = False
         self.active_profile_path = ""
         self.total_estimated_time = 0.0
         self.sequence_start_time = None
         self.is_closing = False
-        
+
         # Telemetry control
         self.telemetry_thread = None
         self.telemetry_active = False
         self.telemetry_fail_count = 0
-
-        # --- Simulation Mock State ---
-        # 1=Installed/Good, 2=Installed/NoLaser(T<0), 0=Empty Slot
-        self.sim_state = {
-            'curr_chan': 1,
-            'T_actual': [22.0] * 8,
-            'I_actual': [0.0] * 8,
-            'TEC_ON': [0] * 8,
-            'LAS_ON': [0] * 8,
-            'LAS_MOD': [1] * 8,
-            'is_installed': [1, 1, 0, 2, 1, 0, 0, 0]  # Exact match to MATLAB
-        }
-        self.sim_query_response = ""
 
         # --- Build GUI Layout ---
         self.setup_layout()
@@ -126,6 +116,71 @@ class LDCControllerApp(ctk.CTk):
 
         # --- Handle Application Closing Gracefully ---
         self.protocol("WM_DELETE_WINDOW", self.close_app)
+
+    # ----------------------------------------------------
+    # CONTROL-CORE PROXIES
+    # ----------------------------------------------------
+    # Compatibility shims so the GUI can keep referring to self.ser /
+    # self.is_stop_requested / self.send_cmd(...) etc. while the hardware state and
+    # protocol I/O actually live in the extracted LaserController (self.ctl). As
+    # the scan / telemetry / ramp / sequence logic migrates into the core in later
+    # Phase-0 sub-steps, these proxies and delegators will be removed.
+    @property
+    def ser(self):
+        return self.ctl.ser
+
+    @ser.setter
+    def ser(self, value):
+        self.ctl.ser = value
+
+    @property
+    def serial_lock(self):
+        return self.ctl.serial_lock
+
+    @property
+    def is_simulated(self):
+        return self.ctl.is_simulated
+
+    @is_simulated.setter
+    def is_simulated(self, value):
+        self.ctl.is_simulated = value
+
+    @property
+    def is_stop_requested(self):
+        return self.ctl.is_stop_requested
+
+    @is_stop_requested.setter
+    def is_stop_requested(self, value):
+        self.ctl.is_stop_requested = value
+
+    @property
+    def is_emo_requested(self):
+        return self.ctl.is_emo_requested
+
+    @is_emo_requested.setter
+    def is_emo_requested(self, value):
+        self.ctl.is_emo_requested = value
+
+    def send_cmd(self, cmd):
+        self.ctl.send_cmd(cmd)
+
+    def read_cmd(self):
+        return self.ctl.read_cmd()
+
+    def query_cmd(self, cmd):
+        return self.ctl.query_cmd(cmd)
+
+    def cmd_pause(self, cmd):
+        self.ctl.cmd_pause(cmd)
+
+    def safe_pause(self, t):
+        self.ctl.safe_pause(t)
+
+    def verify_hw_state(self, cmd, expected_val, err_msg):
+        self.ctl.verify_hw_state(cmd, expected_val, err_msg)
+
+    def check_controller_errors_threadsafe(self, ch_num):
+        return self.ctl.check_controller_errors(ch_num)
 
     def setup_layout(self):
         # Configure root grid weights for responsiveness
@@ -614,9 +669,9 @@ class LDCControllerApp(ctk.CTk):
 
         # Handle Connect
         port_choice = self.com_dropdown.get()
-        self.is_simulated = (port_choice == "Demo Simulator")
 
-        if self.is_simulated:
+        if port_choice == "Demo Simulator":
+            self.ctl.open_simulator()
             self.status_label.configure(text="Status: Demo Mode Active", text_color="#7b1fa2")
             self.btn_connect.configure(text="Disconnect", fg_color="#c62828", hover_color="#b71c1c")
             self.com_dropdown.configure(state="disabled")
@@ -625,8 +680,7 @@ class LDCControllerApp(ctk.CTk):
             return
 
         try:
-            self.ser = serial.Serial(port_choice, baudrate=9600, timeout=5.0)
-            self.ser.reset_input_buffer()
+            self.ctl.open(port_choice, baudrate=9600, timeout=5.0)
             self.status_label.configure(text="Status: Connected (Ready)", text_color="#2e7d32")
             self.btn_connect.configure(text="Disconnect", fg_color="#c62828", hover_color="#b71c1c")
             self.com_dropdown.configure(state="disabled")
@@ -662,137 +716,6 @@ class LDCControllerApp(ctk.CTk):
         for idx in range(self.num_channels):
             self.mark_empty(idx, "Disconnected")
 
-    # --- Write and Read Command Wrappers ---
-    def send_cmd(self, cmd):
-        if self.is_simulated:
-            self.process_sim_cmd(cmd)
-        else:
-            if self.ser:
-                try:
-                    self.ser.write(f"{cmd}\n".encode("ascii"))
-                except serial.SerialException as e:
-                    raise serial.SerialException(f"Hardware connection lost during write: {e}")
-
-    def read_cmd(self):
-        if self.is_simulated:
-            return self.process_sim_query()
-        else:
-            if self.ser:
-                try:
-                    raw = self.ser.readline()
-                except serial.SerialException as e:
-                    raise serial.SerialException(f"Hardware connection lost during read: {e}")
-                try:
-                    return raw.decode("ascii").strip()
-                except:
-                    return ""
-            return ""
-
-    def query_cmd(self, cmd):
-        # Flush stale data, send query, wait, read response
-        if not self.is_simulated and self.ser:
-            self.ser.reset_input_buffer()
-        self.send_cmd(cmd)
-        time.sleep(0.15)
-        return self.read_cmd()
-
-    def cmd_pause(self, cmd):
-        self.send_cmd(cmd)
-        time.sleep(0.15)
-
-    # ----------------------------------------------------
-    # SIMULATION MOCK PROCESSOR
-    # ----------------------------------------------------
-    def process_sim_cmd(self, cmd):
-        parts = cmd.split()
-        if not parts:
-            return
-
-        cmd_root = parts[0]
-        
-        if cmd == "CHAN?":
-            self.sim_query_response = str(self.sim_state['curr_chan'])
-
-        elif cmd_root == "CHAN":
-            ch = int(parts[-1])
-            if self.sim_state['is_installed'][ch - 1] == 0:
-                self.sim_query_response = "ERROR"
-            else:
-                self.sim_state['curr_chan'] = ch
-
-        elif cmd_root in ["TEC:T?", "TEC:SYNCT?"]:
-            ch = self.sim_state['curr_chan']
-            if self.sim_state['is_installed'][ch - 1] == 2:
-                self.sim_query_response = "-10.5"
-            else:
-                self.sim_query_response = f"{self.sim_state['T_actual'][ch - 1]:.2f}"
-
-        elif cmd_root == "TEC:T":
-            if len(parts) > 1:
-                ch = self.sim_state['curr_chan']
-                try:
-                    self.sim_state['T_actual'][ch - 1] = float(parts[-1])
-                except:
-                    pass
-
-        elif cmd_root in ["LAS:LDI?", "LAS:SYNCLDI?"]:
-            ch = self.sim_state['curr_chan']
-            if self.sim_state['is_installed'][ch - 1] == 2:
-                self.sim_query_response = "NaN"
-            else:
-                self.sim_query_response = f"{self.sim_state['I_actual'][ch - 1]:.2f}"
-
-        elif cmd_root == "LAS:LDI":
-            if len(parts) > 1:
-                ch = self.sim_state['curr_chan']
-                try:
-                    self.sim_state['I_actual'][ch - 1] = float(parts[-1])
-                except:
-                    pass
-
-        elif cmd == "TEC:OUT?":
-            ch = self.sim_state['curr_chan']
-            self.sim_query_response = str(self.sim_state['TEC_ON'][ch - 1])
-
-        elif cmd_root == "TEC:OUTPUT":
-            if len(parts) > 1:
-                ch = self.sim_state['curr_chan']
-                try:
-                    self.sim_state['TEC_ON'][ch - 1] = int(parts[-1])
-                except:
-                    pass
-
-        elif cmd == "LAS:OUT?":
-            ch = self.sim_state['curr_chan']
-            self.sim_query_response = str(self.sim_state['LAS_ON'][ch - 1])
-
-        elif cmd_root == "LAS:OUTPUT":
-            if len(parts) > 1:
-                ch = self.sim_state['curr_chan']
-                try:
-                    self.sim_state['LAS_ON'][ch - 1] = int(parts[-1])
-                except:
-                    pass
-
-        elif cmd == "LAS:LIM:I?":
-            self.sim_query_response = "150"
-        elif cmd == "TEC:LIM:THI?":
-            self.sim_query_response = "80"
-        elif cmd == "LAS:MOD?":
-            ch = self.sim_state['curr_chan']
-            self.sim_query_response = str(self.sim_state['LAS_MOD'][ch - 1])
-        elif cmd_root == "LAS:MOD":
-            if len(parts) > 1:
-                ch = self.sim_state['curr_chan']
-                try:
-                    self.sim_state['LAS_MOD'][ch - 1] = int(parts[-1])
-                except:
-                    pass
-        elif cmd == "MODERR?":
-            self.sim_query_response = "0"
-
-    def process_sim_query(self):
-        return self.sim_query_response
 
     # ----------------------------------------------------
     # CHASSIS INTERROGATOR (SCAN CHANNELS)
@@ -1840,76 +1763,6 @@ class LDCControllerApp(ctk.CTk):
         self.after(0, ch["led"].set_color, "#2e7d32")
 
         self.cmd_pause("LAS:MOD 1")
-
-    # --- Verification & Error Helpers (Thread-safe) ---
-    def safe_pause(self, t):
-        time.sleep(t)
-        if self.is_stop_requested:
-            raise RuntimeError("HALT")
-
-    def verify_hw_state(self, cmd, expected_val, err_msg):
-        res = -1
-        for retry in range(2):
-            try:
-                res_val = float(self.query_cmd(cmd))
-                if not math.isnan(res_val) and int(res_val) == expected_val:
-                    return
-                res = res_val
-            except:
-                pass
-            self.safe_pause(0.15)
-        raise RuntimeError(f"{err_msg} (Expected {expected_val}, Got {res})")
-
-    def check_controller_errors_threadsafe(self, ch_num):
-        # MODERR? returns a list of numeric module/command error codes (e.g. "0",
-        # "504", or a comma/space separated list). Parse out the individual integer
-        # tokens and compare exactly, rather than doing substring matches on the raw
-        # string — the old `"504" in err_str` test would false-match codes like
-        # "5040" or "1504" and misreport faults.
-        KNOWN = ["501", "504", "503", "505", "508", "511", "404", "407"]
-        err_str = ""
-        codes = []
-        for retry in range(3):
-            self.send_cmd(f"CHAN {ch_num}")
-            time.sleep(0.1)
-
-            if not self.is_simulated and self.ser:
-                self.ser.reset_input_buffer()
-
-            self.send_cmd("MODERR?")
-            time.sleep(0.15)
-            err_resp = self.read_cmd()
-            err_str = err_resp.strip()
-            codes = re.findall(r"\d+", err_str)
-
-            # No error: nothing returned, or every returned code is zero.
-            if not codes or all(int(c) == 0 for c in codes):
-                return False, ""
-
-            # Stop retrying once we see a recognized fault code.
-            if any(c in codes for c in KNOWN):
-                break
-            time.sleep(0.2)
-
-        if not codes or all(int(c) == 0 for c in codes):
-            return False, ""
-
-        if "501" in codes:
-            return True, f"Interlock Error (E501): Key switch is off. [{err_str}]"
-        elif "504" in codes:
-            return True, f"Current Limit Reached (E504). [{err_str}]"
-        elif "503" in codes:
-            return True, f"Voltage Limit Reached / Open Circuit (E503). [{err_str}]"
-        elif "505" in codes:
-            return True, f"Voltage Limit Warning (E505). [{err_str}]"
-        elif "508" in codes:
-            return True, f"TEC Off Status Forced LAS Off (E508). [{err_str}]"
-        elif "511" in codes:
-            return True, f"Hardware Error (E511). [{err_str}]"
-        elif "404" in codes or "407" in codes:
-            return True, f"Temperature Limit Error. [{err_str}]"
-        else:
-            return True, f"Module Error Code: {err_str}"
 
     # --- UI Dispatch Update Helpers ---
     def update_channel_status(self, idx, text, color):
