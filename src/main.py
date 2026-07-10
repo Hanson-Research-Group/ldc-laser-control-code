@@ -352,6 +352,9 @@ class LDCMainWindow(QMainWindow):
         self.active_profile_path = ""
         self._unsaved = False
         self._MODE_KEYS = ("sequential", "stage", "parallel")
+        self._MODE_NAMES = ("One laser at a time",
+                            "All temps, then currents",
+                            "All lasers at once")
         # Follow the OS light/dark theme (Qt 6.5+), and track live changes.
         hints = QApplication.instance().styleHints()
         try:
@@ -532,20 +535,23 @@ class LDCMainWindow(QMainWindow):
         bottom.addWidget(self.btn_emo)
 
         run_col = QVBoxLayout(); run_col.setSpacing(6)
-        mode_row = QHBoxLayout(); mode_row.setSpacing(6)
-        mlbl = QLabel("Ramp mode:"); mlbl.setObjectName("hdr")
-        mode_row.addWidget(mlbl)
-        # Order matches self._MODE_KEYS; labels get a live "(~m:ss)" estimate suffix.
+        # Ramp-mode selector on its own full-width line (label above) with the
+        # per-mode time estimate baked into each item's text.
+        mlbl = QLabel("Ramp mode:"); mlbl.setObjectName("caption")
+        run_col.addWidget(mlbl)
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Per-channel", "By stage", "Parallel"])
+        self.mode_combo.addItems(list(self._MODE_NAMES))  # order matches _MODE_KEYS
+        self.mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.mode_combo.setMinimumWidth(280)
         self.mode_combo.setToolTip(
-            "Per-channel: finish each laser's temp→current before the next.\n"
-            "By stage: ramp all temperatures, then all currents (safe start/stop sync).\n"
-            "Parallel: ramp every laser at once (fastest). Validate on hardware.")
-        mode_row.addWidget(self.mode_combo, 1)
-        run_col.addLayout(mode_row)
+            "One laser at a time: finish each laser's temp→current before the next.\n"
+            "All temperatures, then all currents: ramps every channel's temperature "
+            "first, then every channel's current (safe for startup and shutdown).\n"
+            "All lasers at once: ramp every channel simultaneously (fastest).")
+        self.mode_combo.currentIndexChanged.connect(self._mark_unsaved)
+        run_col.addWidget(self.mode_combo)
         self.btn_run_all = QPushButton("▶ RUN ALL"); self.btn_run_all.setEnabled(False)
-        self.btn_run_all.setMinimumHeight(48); self.btn_run_all.setMinimumWidth(210)
+        self.btn_run_all.setMinimumHeight(48); self.btn_run_all.setMinimumWidth(280)
         self.btn_run_all.setStyleSheet("background:#2e7d32; color:white; font-size:16px; font-weight:bold; border-radius:8px;")
         self.btn_run_all.clicked.connect(self.execute_all)
         run_col.addWidget(self.btn_run_all)
@@ -1014,7 +1020,7 @@ class LDCMainWindow(QMainWindow):
     def _update_mode_estimates(self):
         if not hasattr(self, "mode_combo"):
             return
-        names = ["Per-channel", "By stage", "Parallel"]
+        names = self._MODE_NAMES
         try:
             tr = float(self.t_ramp.text()); ir = float(self.i_ramp.text()); to = float(self.t_off.text())
         except (ValueError, AttributeError):
@@ -1195,7 +1201,8 @@ class LDCMainWindow(QMainWindow):
         try:
             data = {"COM_Port": self.com_combo.currentText(),
                     "T_ramp": float(self.t_ramp.text()), "I_ramp": float(self.i_ramp.text()),
-                    "T_OFF_Target": float(self.t_off.text()), "channels": []}
+                    "T_OFF_Target": float(self.t_off.text()),
+                    "Ramp_Mode": self._selected_mode(), "channels": []}
             for c in self.cards:
                 data["channels"].append({"T_Target": float(c.t_target.text() or 0),
                                          "I_Target": float(c.i_target.text() or 0),
@@ -1221,6 +1228,11 @@ class LDCMainWindow(QMainWindow):
             self.t_ramp.setText(str(data["T_ramp"]))
             self.i_ramp.setText(str(data["I_ramp"]))
             self.t_off.setText(str(data["T_OFF_Target"]))
+            mode = data.get("Ramp_Mode", "sequential")
+            if mode in self._MODE_KEYS:
+                self.mode_combo.blockSignals(True)
+                self.mode_combo.setCurrentIndex(self._MODE_KEYS.index(mode))
+                self.mode_combo.blockSignals(False)
             for k, cfg in enumerate(data["channels"][:self.num_channels]):
                 self.cards[k].t_target.setText(str(cfg["T_Target"]))
                 self.cards[k].i_target.setText(str(cfg["I_Target"]))
@@ -1239,6 +1251,9 @@ class LDCMainWindow(QMainWindow):
                                 "Clear the active profile and reset all settings to defaults?") != QMessageBox.Yes:
             return
         self.t_ramp.setText("0.1"); self.i_ramp.setText("0.5"); self.t_off.setText("22.0")
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.setCurrentIndex(0)  # back to "One laser at a time"
+        self.mode_combo.blockSignals(False)
         for k, c in enumerate(self.cards):
             c.t_target.setText("22.0"); c.i_target.setText("0.0"); c.label.setText(f"Laser {k + 1}")
         try:
