@@ -34,7 +34,7 @@ jobs:
       - name: Create Release and Upload Asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/LDC3908_ModularLaserDiodeControllerSoftware.exe
+          files: dist/LaserControllerConsole.exe
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

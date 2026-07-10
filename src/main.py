@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Newport LDC-3908 Laser Diode Controller — PySide6 / Qt front-end.
+Laser Controller Console — PySide6 / Qt front-end.
 
-Qt GUI on top of the UI-agnostic control core:
-  * laser_controller.LaserController — serial I/O, simulator, safety helpers
-  * sequencer.Sequencer              — safety state machine + ramps
+Control software for laser diode controllers. The GUI is device-agnostic: it
+drives a controller through a driver (driver.LaserControllerDriver) and the
+ramp/sequence engine (sequencer.Sequencer). The only controller supported today
+is the ILX Lightwave LDC-3908 (ldc3908.LDC3908Driver); adding another is a matter
+of writing a new driver.
 
 A QtBridge turns the engine's SequenceEvents callbacks (fired on worker threads)
 into Qt signals delivered to the GUI thread via queued connections.
@@ -29,9 +31,13 @@ from PySide6.QtWidgets import (
 
 import serial.tools.list_ports
 
-from laser_controller import LaserController
+from ldc3908 import LDC3908Driver
 from sequencer import Sequencer, SequenceEvents, ChannelPlan, estimate_run_times
 import theme
+
+# The controller driver the app uses. Swap this for another
+# LaserControllerDriver subclass to support a different controller.
+DRIVER_CLASS = LDC3908Driver
 
 PREF_FILE = os.path.join(os.path.expanduser("~"), ".ldc_laser_control_prefs.json")
 CARD_W = 300  # logical px; approx one compact card width incl. margins
@@ -347,10 +353,10 @@ class ChannelCard(QFrame):
 class LDCMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.num_channels = 8
-        self.ctl = LaserController(num_channels=self.num_channels)
+        self.driver = DRIVER_CLASS()
+        self.num_channels = self.driver.num_channels
         self.bridge = QtBridge()
-        self.seq = Sequencer(self.ctl, events=QtSequenceEvents(self.bridge))
+        self.seq = Sequencer(self.driver, events=QtSequenceEvents(self.bridge))
 
         self.is_executing = False
         self.is_scanning = False
@@ -382,7 +388,7 @@ class LDCMainWindow(QMainWindow):
         self._table_mode = True
         self._reflow_cols = 0
 
-        self.setWindowTitle("LDC-3908 Modular Laser Diode Controller Software v0.5.0")
+        self.setWindowTitle("Laser Controller Console v0.5.0 — ILX Lightwave LDC-3908")
         self.resize(1500, 860)
         self.setMinimumSize(900, 620)
         for ext in ("src/laser_controller_icon.ico", "src/laser_controller_icon.png"):
@@ -759,11 +765,11 @@ class LDCMainWindow(QMainWindow):
             return
         choice = self.com_combo.currentText()
         if choice == "Demo Simulator":
-            self.ctl.open_simulator()
+            self.driver.open_simulator()
             self._set_status("Status: Demo Mode Active")
         else:
             try:
-                self.ctl.open(choice, baudrate=9600, timeout=5.0)
+                self.driver.open(choice, timeout=5.0)
             except Exception as e:
                 QMessageBox.critical(self, "Connection Error", f"Failed to connect to {choice}:\n{e}")
                 self._set_status("Status: Connection Failed")
@@ -778,7 +784,7 @@ class LDCMainWindow(QMainWindow):
         self.telemetry_active = False
         if self.telemetry_thread and self.telemetry_thread.is_alive():
             self.telemetry_thread.join(timeout=1.0)
-        self.ctl.close()
+        self.driver.close()
         self._set_status("Status: Disconnected")
         self.btn_connect.setText("Connect")
         self.com_combo.setEnabled(True)
@@ -803,50 +809,50 @@ class LDCMainWindow(QMainWindow):
     def _run_scan(self):
         cards = 0
         for k in range(self.num_channels):
-            if self.is_closing or not self.ctl.is_connected:
+            if self.is_closing or not self.driver.is_connected:
                 break
             ch_num = k + 1
-            with self.ctl.serial_lock:
+            with self.driver.serial_lock:
                 try:
-                    self.ctl.cmd_pause(f"CHAN {ch_num}")
+                    self.driver.select_channel(ch_num)
                     time.sleep(0.1)
-                    ans = self.ctl.query_cmd("CHAN?")
                     try:
-                        ans_i = int(ans)
+                        ans_i = self.driver.active_channel()
                     except Exception:
                         ans_i = -1
-                    if not ans or ans_i != ch_num:
+                    if ans_i != ch_num:
                         self._post(self._mark_empty, k, "Empty Slot")
                         continue
                     cards += 1
-                    t_str = self.ctl.query_cmd("TEC:T?")
                     try:
-                        t_val = float(t_str)
+                        t_val = self.driver.temp_setpoint()
                     except Exception:
                         t_val = float('nan')
-                    i_str = self.ctl.query_cmd("LAS:LDI?")
                     try:
-                        i_val = float(i_str)
+                        i_val = self.driver.current_setpoint()
                     except Exception:
                         i_val = 0.0
                     try:
-                        tec_out = int(float(self.ctl.query_cmd("TEC:OUT?")))
-                        las_out = int(float(self.ctl.query_cmd("LAS:OUT?")))
+                        tec_out = self.driver.tec_output()
+                        las_out = self.driver.laser_output()
                     except Exception:
                         tec_out = las_out = 0
-                    if not t_str or math.isnan(t_val) or t_val < 0:
+                    # A negative/NaN setpoint means the slot has a module but no
+                    # laser attached (see note in the driver simulator). A real
+                    # laser's setpoint is never below 0 degC in our use case.
+                    if math.isnan(t_val) or t_val < 0:
                         self._post(self._mark_empty, k, "No Laser Attached")
                         continue
-                    has_err, err = self.ctl.check_controller_errors(ch_num)
+                    has_err, err = self.driver.read_errors()
                     try:
-                        max_t = float(self.ctl.query_cmd("TEC:LIM:THI?"))
+                        max_t = self.driver.temp_limit()
                     except Exception:
                         max_t = 99.0
                     try:
-                        max_i = float(self.ctl.query_cmd("LAS:LIM:I?"))
+                        max_i = self.driver.current_limit()
                     except Exception:
                         max_i = 500.0
-                    self.ctl.cmd_pause("LAS:MOD 1")
+                    self.driver.enable_modulation()
                     self._post(self._update_after_scan, k, t_val, i_val, tec_out, las_out,
                                max_t, max_i, has_err, err)
                 except Exception as e:
@@ -916,8 +922,8 @@ class LDCMainWindow(QMainWindow):
             time.sleep(2.0)
 
     def _telemetry_cycle(self):
-        with self.ctl.serial_lock:
-            if not self.ctl.is_connected:
+        with self.driver.serial_lock:
+            if not self.driver.is_connected:
                 return
             any_on = False
             for k in range(self.num_channels):
@@ -927,15 +933,21 @@ class LDCMainWindow(QMainWindow):
                     continue
                 ch_num = k + 1
                 try:
-                    self.ctl.cmd_pause(f"CHAN {ch_num}")
-                    t_str = self.ctl.query_cmd("TEC:T?")
-                    i_str = self.ctl.query_cmd("LAS:LDI?")
+                    self.driver.select_channel(ch_num)
                     try:
-                        tec = int(float(self.ctl.query_cmd("TEC:OUT?")))
-                        las = int(float(self.ctl.query_cmd("LAS:OUT?")))
+                        t_val = self.driver.temp_setpoint()
+                    except Exception:
+                        t_val = None
+                    try:
+                        i_val = self.driver.current_setpoint()
+                    except Exception:
+                        i_val = None
+                    try:
+                        tec = self.driver.tec_output()
+                        las = self.driver.laser_output()
                     except Exception:
                         tec = las = None
-                    self._post(self._telemetry_update, k, t_str, i_str, tec, las)
+                    self._post(self._telemetry_update, k, t_val, i_val, tec, las)
                     if las == 1:
                         any_on = True
                     self.telemetry_fail_count = 0
@@ -948,13 +960,13 @@ class LDCMainWindow(QMainWindow):
                         break
             self._post(self.btn_emo.setEnabled, any_on)
 
-    def _telemetry_update(self, i, t_str, i_str, tec, las):
+    def _telemetry_update(self, i, t_val, i_val, tec, las):
         try:
-            self.cards[i].live_t.setText(f"{float(t_str):.1f}")
+            self.cards[i].live_t.setText(f"{float(t_val):.1f}")
         except Exception:
             pass
         try:
-            self.cards[i].live_i.setText(f"{float(i_str):.1f}")
+            self.cards[i].live_i.setText(f"{float(i_val):.1f}")
         except Exception:
             pass
         if tec is not None:
@@ -969,8 +981,8 @@ class LDCMainWindow(QMainWindow):
         self._set_status("Status: Connection Lost")
         self._lock_controls(False)
         self.btn_connect.setText("Connect")
-        self.ctl.ser = None
-        self.ctl.is_stop_requested = True
+        self.driver.ser = None
+        self.driver.is_stop_requested = True
         QMessageBox.critical(self, "Connection Lost",
                              "Hardware communication lost. Execution halted. Lasers not explicitly shut off.")
 
@@ -1028,8 +1040,8 @@ class LDCMainWindow(QMainWindow):
         infos = self._infos_from_cards([p.ch_num for p in plans if p.targets_valid])
         self.total_estimated_time = estimate_run_times(infos, t_ramp, i_ramp, t_off).get(mode, 0.0)
         self.is_executing = True
-        self.ctl.is_stop_requested = False
-        self.ctl.is_emo_requested = False
+        self.driver.is_stop_requested = False
+        self.driver.is_emo_requested = False
         self._set_status("Status: Sequence Running...")
         self._lock_controls(False)
         self.btn_stop.setEnabled(True)
@@ -1086,10 +1098,10 @@ class LDCMainWindow(QMainWindow):
         self.is_executing = False
         self._lock_controls(True)
         self.btn_stop.setEnabled(False)
-        if self.ctl.is_emo_requested:
+        if self.driver.is_emo_requested:
             self._perform_emergency_shutdown()
-            self.ctl.is_emo_requested = False
-        elif self.ctl.is_stop_requested:
+            self.driver.is_emo_requested = False
+        elif self.driver.is_stop_requested:
             self._set_status("Status: Hardware Halted & Pinned.")
         else:
             self._set_status("Status: Sequence Complete & Settled.")
@@ -1111,7 +1123,7 @@ class LDCMainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def stop_execution(self):
         if self.is_executing:
-            self.ctl.is_stop_requested = True
+            self.driver.is_stop_requested = True
             self._set_status("Status: STOP COMMANDED. Halting safely...")
             self._triple_bell()
 
@@ -1120,8 +1132,8 @@ class LDCMainWindow(QMainWindow):
                                 "Immediately cutting current without ramping can damage the diode. Proceed?") \
                 != QMessageBox.Yes:
             return
-        self.ctl.is_stop_requested = True
-        self.ctl.is_emo_requested = True
+        self.driver.is_stop_requested = True
+        self.driver.is_emo_requested = True
         if self.is_executing:
             self._set_status("Status: EMERGENCY OFF — cutting laser...")
             return
@@ -1129,14 +1141,14 @@ class LDCMainWindow(QMainWindow):
         self._emo_thread.start()
 
     def _perform_emergency_shutdown(self):
-        with self.ctl.serial_lock:
+        with self.driver.serial_lock:
             for k in range(self.num_channels):
                 if not self.populated[k]:
                     continue
                 try:
-                    self.ctl.send_cmd(f"CHAN {k + 1}")
+                    self.driver.select_channel(k + 1)
                     time.sleep(0.15)
-                    self.ctl.send_cmd("LAS:OUTPUT 0")
+                    self.driver.set_laser(False)
                     self._post(self._on_status, k, "EMERGENCY OFF: Current Cut", "fault")
                     self._post(self._on_led, k, "fault")
                 except Exception:
@@ -1147,13 +1159,13 @@ class LDCMainWindow(QMainWindow):
         self._set_status("Status: Clearing chassis faults...")
 
         def run():
-            with self.ctl.serial_lock:
+            with self.driver.serial_lock:
                 for k in range(self.num_channels):
                     if not self.populated[k]:
                         continue
                     try:
-                        self.ctl.send_cmd(f"CHAN {k + 1}"); time.sleep(0.1)
-                        self.ctl.send_cmd("*CLS"); time.sleep(0.1)
+                        self.driver.select_channel(k + 1); time.sleep(0.1)
+                        self.driver.clear_module(); time.sleep(0.1)
                     except Exception:
                         pass
             self.is_scanning = True
@@ -1354,7 +1366,7 @@ class LDCMainWindow(QMainWindow):
             self.telemetry_thread.join(timeout=1.0)
         if self._emo_thread and self._emo_thread.is_alive():
             self._emo_thread.join(timeout=3.0)
-        self.ctl.close()
+        self.driver.close()
         event.accept()
 
 

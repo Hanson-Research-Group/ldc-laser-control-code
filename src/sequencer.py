@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 """
-UI-agnostic laser ramp / sequence engine for the Newport LDC-3908.
+Device-agnostic laser ramp / sequence engine.
 
-This is the safety-critical control logic — the per-channel safety state machine
-and the temperature/current ramps — independent of any GUI. It drives hardware
-through a LaserController and reports everything the UI needs to draw through a
-SequenceEvents sink instead of touching widgets directly.
+The safety-critical control logic — the per-channel safety state machine and the
+temperature/current ramps. It is independent of any specific controller: all
+hardware access goes through a LaserControllerDriver (driver.py), and all UI
+feedback goes through a SequenceEvents sink. Swapping in a different controller
+means writing a new driver; this engine does not change.
 
-Three execution modes (all share the SAME per-channel safety sequence and the
-SAME ramp primitives, so interlocks are identical in every mode):
+Three execution modes (all share the SAME per-channel safety sequence and ramp
+primitives, so interlocks are identical in every mode):
 
   * "sequential" (default) — one channel completes its full temp->current
     sequence before the next starts.
   * "stage"                — all channels move through the temperature stage,
-    then all through the current stage. Stages are auto-ordered
+    then all through the current stage, auto-ordered
     (current-down -> temperature -> current-up) so the TEC-before-LAS interlock
     holds for both start-up and shut-down.
-  * "parallel"             — every channel ramps at once, one worker thread each.
-    Each serial transaction re-selects its channel under the lock; the long
-    ramp/settle pauses happen outside the lock, so they overlap across channels.
+  * "parallel"             — every channel ramps at once, one worker thread each;
+    each serial transaction re-selects its channel under the lock, and the long
+    pauses happen outside the lock so they overlap across channels.
 
-Serial I/O is routed through a per-channel "bus" so the state machine code is
-mode-agnostic: _SequentialBus (caller holds the lock, channel pre-selected) vs
-_ParallelBus (per-transaction re-select + lock).
+A per-channel `_Bus` mediates I/O: in sequential/stage mode the caller holds the
+serial lock and has selected the channel, so operations pass straight to the
+driver; in parallel mode each operation re-selects the channel under the lock.
 
 No GUI imports. Exercised head-less in test_sequencer.py against the simulator.
 """
@@ -49,8 +50,6 @@ _TEC_ON_TIME = 1.0
 _LAS_ON_TIME = 4.0
 _LAS_OFF_TIME = 1.5
 _TEC_OFF_TIME = 1.0
-# Fraction of ramp movement time that is un-overlappable serial traffic; used to
-# approximate parallel wall-clock (the rest — the settle pauses — overlaps).
 _PARALLEL_SERIAL_FRAC = 0.4
 
 
@@ -99,9 +98,9 @@ class ChannelPlan:
 # Run-time estimate (used by the GUI to label the mode selector).
 # ----------------------------------------------------------------------------
 def _channel_cost(info, t_ramp, i_ramp, t_off):
-    """Return (movement_seconds, overhead_seconds) for one channel, mirroring the
-    same branch logic the sequencer executes. `info` is a dict with keys
-    curr_t, curr_i, t_target, i_target, tec_cmd, las_cmd, live_tec, live_las."""
+    """Return (movement_seconds, overhead_seconds) for one channel. `info` is a
+    dict with keys curr_t, curr_i, t_target, i_target, tec_cmd, las_cmd,
+    live_tec, live_las."""
     ct, ci = info["curr_t"], info["curr_i"]
     tt, ti = info["t_target"], info["i_target"]
     tc, lc = info["tec_cmd"], info["las_cmd"]
@@ -135,110 +134,139 @@ def _channel_cost(info, t_ramp, i_ramp, t_off):
 
 def estimate_run_times(infos, t_ramp, i_ramp, t_off):
     """Approximate wall-clock seconds for each mode. Sequential and stage do the
-    same total work (stage just reorders it); parallel overlaps the settle pauses
-    but is floored by the shared serial traffic and by the single longest channel.
-    Returns {"sequential": s, "stage": s, "parallel": s}. Best-effort — clearly
-    an estimate."""
+    same total work; parallel overlaps the settle pauses but is floored by the
+    shared serial traffic and by the single longest channel. Best-effort."""
     if t_ramp <= 0 or i_ramp <= 0 or not infos:
         return {"sequential": 0.0, "stage": 0.0, "parallel": 0.0}
     costs = [_channel_cost(i, t_ramp, i_ramp, t_off) for i in infos]
     moves = [m for m, _ in costs]
     ovhs = [o for _, o in costs]
     total = sum(moves) + sum(ovhs)
-    seq = total
-    stage = total  # same work, reordered by stage
     par_move = max(max(moves), _PARALLEL_SERIAL_FRAC * sum(moves)) if moves else 0.0
-    par = min(par_move + (max(ovhs) if ovhs else 0.0), seq)
-    return {"sequential": seq, "stage": stage, "parallel": par}
+    par = min(par_move + (max(ovhs) if ovhs else 0.0), total)
+    return {"sequential": total, "stage": total, "parallel": par}
 
 
 # ----------------------------------------------------------------------------
-# Per-channel serial buses.
+# Per-channel serial bus. Mediates driver access for one channel; the `parallel`
+# flag decides whether each operation re-selects the channel under the lock.
 # ----------------------------------------------------------------------------
-class _SequentialBus:
-    """SEQUENTIAL/STAGE mode: the caller holds the serial lock and has selected
-    the channel, so ops delegate straight to the controller (original behavior)."""
-    def __init__(self, ctl, ch_num):
-        self.ctl = ctl
+class _Bus:
+    SETTLE = 0.15  # channel-switch settle before a parallel transaction
+
+    def __init__(self, driver, ch_num, parallel):
+        self.driver = driver
         self.ch_num = ch_num
         self.idx = ch_num - 1
+        self.parallel = parallel
 
-    def send(self, cmd):
-        self.ctl.send_cmd(cmd)
+    def _txn(self, fn):
+        """Run a single driver operation. In parallel mode, re-select this channel
+        and hold the serial lock only for this operation; otherwise the caller
+        already holds the lock and has selected the channel."""
+        if self.parallel:
+            with self.driver.serial_lock:
+                self.driver.select_channel(self.ch_num)
+                time.sleep(self.SETTLE)
+                return fn()
+        return fn()
 
-    def query(self, cmd):
-        return self.ctl.query_cmd(cmd)
-
-    def cmd_pause(self, cmd):
-        self.ctl.cmd_pause(cmd)
-
+    # cooperative pause (outside any lock so other channels proceed)
     def pause(self, t):
-        self.ctl.safe_pause(t)
+        if self.parallel:
+            time.sleep(t)
+            if self.driver.is_stop_requested:
+                raise RuntimeError("HALT")
+        else:
+            self.driver.safe_pause(t)
 
-    def verify(self, cmd, expected, msg):
-        self.ctl.verify_hw_state(cmd, expected, msg)
+    # selection
+    def select(self):
+        self._txn(lambda: self.driver.select_channel(self.ch_num))
+
+    def active_channel(self):
+        return self._txn(self.driver.active_channel)
+
+    # reads
+    def tec_output(self):
+        return self._txn(self.driver.tec_output)
+
+    def laser_output(self):
+        return self._txn(self.driver.laser_output)
+
+    def modulation(self):
+        return self._txn(self.driver.modulation)
+
+    def temperature(self):
+        return self._txn(self.driver.temperature)
+
+    def temp_setpoint(self):
+        return self._txn(self.driver.temp_setpoint)
+
+    def current(self):
+        return self._txn(self.driver.current)
+
+    def temp_limit(self):
+        return self._txn(self.driver.temp_limit)
+
+    def current_limit(self):
+        return self._txn(self.driver.current_limit)
+
+    # writes
+    def disable_modulation(self):
+        self._txn(self.driver.disable_modulation)
+
+    def enable_modulation(self):
+        self._txn(self.driver.enable_modulation)
+
+    def set_tec(self, on):
+        self._txn(lambda: self.driver.set_tec(on))
+
+    def set_laser(self, on):
+        self._txn(lambda: self.driver.set_laser(on))
+
+    def set_temp_setpoint(self, x):
+        self._txn(lambda: self.driver.set_temp_setpoint(x))
+
+    def set_current_setpoint(self, x):
+        self._txn(lambda: self.driver.set_current_setpoint(x))
 
     def check_errors(self):
-        return self.ctl.check_controller_errors(self.ch_num)
+        return self._txn(self.driver.read_errors)
 
+    # read-back verification (retries, then raises)
+    def _verify(self, reader, expected, msg):
+        res = -1
+        for _ in range(2):
+            try:
+                val = self._txn(reader)
+                if not (isinstance(val, float) and math.isnan(val)) and int(val) == expected:
+                    return
+                res = val
+            except Exception:
+                pass
+            self.pause(0.15)
+        raise RuntimeError(f"{msg} (Expected {expected}, Got {res})")
 
-class _ParallelBus:
-    """PARALLEL mode: no lock held between ops. Each transaction re-selects this
-    channel and holds the serial lock only for that single transaction, so
-    channels interleave on the bus and their pauses (outside the lock) overlap.
-    Per-channel safety ordering is preserved — each channel runs the full state
-    machine in its own thread."""
-    SETTLE = 0.15  # channel-switch settle before each transaction
+    def verify_tec(self, expected, msg):
+        self._verify(self.driver.tec_output, expected, msg)
 
-    def __init__(self, ctl, ch_num):
-        self.ctl = ctl
-        self.ch_num = ch_num
-        self.idx = ch_num - 1
+    def verify_laser(self, expected, msg):
+        self._verify(self.driver.laser_output, expected, msg)
 
-    def send(self, cmd):
-        with self.ctl.serial_lock:
-            self.ctl.send_cmd(f"CHAN {self.ch_num}")
-            time.sleep(self.SETTLE)
-            self.ctl.send_cmd(cmd)
-
-    def query(self, cmd):
-        with self.ctl.serial_lock:
-            self.ctl.send_cmd(f"CHAN {self.ch_num}")
-            time.sleep(self.SETTLE)
-            return self.ctl.query_cmd(cmd)
-
-    def cmd_pause(self, cmd):
-        self.send(cmd)
-        time.sleep(0.15)  # pause outside the lock so other channels proceed
-
-    def pause(self, t):
-        time.sleep(t)
-        if self.ctl.is_stop_requested:
-            raise RuntimeError("HALT")
-
-    def verify(self, cmd, expected, msg):
-        with self.ctl.serial_lock:
-            self.ctl.send_cmd(f"CHAN {self.ch_num}")
-            time.sleep(self.SETTLE)
-            self.ctl.verify_hw_state(cmd, expected, msg)
-
-    def check_errors(self):
-        with self.ctl.serial_lock:
-            return self.ctl.check_controller_errors(self.ch_num)
+    def verify_modulation_off(self, msg):
+        self._verify(self.driver.modulation, 0, msg)
 
 
 class Sequencer:
-    def __init__(self, controller, events=None):
-        self.ctl = controller
+    def __init__(self, driver, events=None):
+        self.driver = driver
         self.events = events or SequenceEvents()
 
     # ----------------------------------------------------
     # TOP-LEVEL DISPATCH
     # ----------------------------------------------------
     def run(self, plans: List[ChannelPlan], t_ramp, i_ramp, t_off_target, mode="sequential"):
-        """Execute the plans in the chosen mode. Aborts on the first fault/halt
-        (setting the controller's stop flag). All feedback goes through events;
-        the caller inspects the controller flags for final status."""
         if mode == "parallel":
             self._run_parallel(plans, t_ramp, i_ramp, t_off_target)
         elif mode == "stage":
@@ -266,20 +294,20 @@ class Sequencer:
     # ----------------------------------------------------
     def _run_sequential(self, plans, t_ramp, i_ramp, t_off):
         for plan in plans:
-            if self.ctl.is_stop_requested:
+            if self.driver.is_stop_requested:
                 break
             if not plan.targets_valid:
                 self.events.on_status(plan.idx, "Invalid targets", C_FAULT)
                 continue
             try:
-                with self.ctl.serial_lock:
-                    self.ctl.send_cmd(f"CHAN {plan.ch_num}")
+                with self.driver.serial_lock:
+                    self.driver.select_channel(plan.ch_num)
                     time.sleep(0.1)
-                    bus = _SequentialBus(self.ctl, plan.ch_num)
+                    bus = _Bus(self.driver, plan.ch_num, parallel=False)
                     self._run_one(bus, plan, t_ramp, i_ramp, t_off)
             except Exception as e:
                 self._handle_exception(plan, e)
-                self.ctl.is_stop_requested = True
+                self.driver.is_stop_requested = True
                 break
 
     # ----------------------------------------------------
@@ -289,14 +317,14 @@ class Sequencer:
         valid = self._report_invalid(plans)
 
         def worker(plan):
-            if self.ctl.is_stop_requested:
+            if self.driver.is_stop_requested:
                 return
-            bus = _ParallelBus(self.ctl, plan.ch_num)
+            bus = _Bus(self.driver, plan.ch_num, parallel=True)
             try:
                 self._run_one(bus, plan, t_ramp, i_ramp, t_off)
             except Exception as e:
                 self._handle_exception(plan, e)
-                self.ctl.is_stop_requested = True  # abort the other channels
+                self.driver.is_stop_requested = True  # abort the other channels
 
         threads = [threading.Thread(target=worker, args=(p,), daemon=True) for p in valid]
         for t in threads:
@@ -309,30 +337,27 @@ class Sequencer:
     # ----------------------------------------------------
     def _run_stage(self, plans, t_ramp, i_ramp, t_off):
         valid = self._report_invalid(plans)
-        # Order matters for safety: prepare -> drop current on anything turning off
-        # -> move all temperatures -> raise current on anything turning on.
         for stage_fn in (self._stage_init, self._stage_current_down,
                          self._stage_temperature, self._stage_current_up,
                          self._stage_finalize):
             for plan in valid:
-                if self.ctl.is_stop_requested:
+                if self.driver.is_stop_requested:
                     return
                 try:
-                    with self.ctl.serial_lock:
-                        self.ctl.send_cmd(f"CHAN {plan.ch_num}")
+                    with self.driver.serial_lock:
+                        self.driver.select_channel(plan.ch_num)
                         time.sleep(0.1)
-                        bus = _SequentialBus(self.ctl, plan.ch_num)
+                        bus = _Bus(self.driver, plan.ch_num, parallel=False)
                         stage_fn(bus, plan, t_ramp, i_ramp, t_off)
                 except Exception as e:
                     self._handle_exception(plan, e)
-                    self.ctl.is_stop_requested = True
+                    self.driver.is_stop_requested = True
                     return
 
     def _stage_init(self, bus, plan, t_ramp, i_ramp, t_off):
         self._validate_limits(bus, plan)
-        idx = bus.idx
-        self.events.on_status(idx, "Initializing...", C_INIT)
-        self.events.on_led(idx, LED_RAMP)
+        self.events.on_status(bus.idx, "Initializing...", C_INIT)
+        self.events.on_led(bus.idx, LED_RAMP)
         self._align_and_disable_mod(bus)
         tec, las = self._read_states(bus)
         if tec == 0 and las == 1:
@@ -342,30 +367,30 @@ class Sequencer:
         if plan.las_cmd != "OFF":
             return
         try:
-            las = int(float(bus.query("LAS:OUT?")))
+            las = bus.laser_output()
         except Exception:
             las = -1
         if las == 1:
             self.ramp_current(bus, 0.0, i_ramp)
             bus.pause(0.15)
-            bus.send("LAS:OUTPUT 0")
+            bus.set_laser(False)
             bus.pause(0.2)
-            bus.verify("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
+            bus.verify_laser(0, "LAS OFF acknowledge failed.")
             self.events.on_live_output(bus.idx, "LAS", "OFF")
             bus.pause(0.5)
 
     def _stage_temperature(self, bus, plan, t_ramp, i_ramp, t_off):
         try:
-            tec = int(float(bus.query("TEC:OUT?")))
+            tec = bus.tec_output()
         except Exception:
             tec = -1
         if plan.tec_cmd == "ON":
             if tec == 0:
                 self.tec_temp_tset_tcurr(bus)
                 bus.pause(0.15)
-                bus.send("TEC:OUTPUT 1")
+                bus.set_tec(True)
                 bus.pause(0.2)
-                bus.verify("TEC:OUT?", 1, "TEC ON acknowledge failed.")
+                bus.verify_tec(1, "TEC ON acknowledge failed.")
                 self.events.on_live_output(bus.idx, "TEC", "ON")
                 bus.pause(0.15)
             self.ramp_temp(bus, plan.t_target, t_ramp)
@@ -373,9 +398,9 @@ class Sequencer:
             if tec == 1:
                 self.ramp_temp(bus, t_off, t_ramp)
                 bus.pause(0.15)
-                bus.send("TEC:OUTPUT 0")
+                bus.set_tec(False)
                 bus.pause(0.2)
-                bus.verify("TEC:OUT?", 0, "TEC OFF acknowledge failed.")
+                bus.verify_tec(0, "TEC OFF acknowledge failed.")
                 self.events.on_live_output(bus.idx, "TEC", "OFF")
                 bus.pause(0.5)
 
@@ -383,15 +408,15 @@ class Sequencer:
         if plan.las_cmd != "ON":
             return
         try:
-            las = int(float(bus.query("LAS:OUT?")))
+            las = bus.laser_output()
         except Exception:
             las = -1
         if las == 0:
-            bus.send("LAS:LDI 0.0")
+            bus.set_current_setpoint(0.0)
             bus.pause(0.15)
-            bus.send("LAS:OUTPUT 1")
+            bus.set_laser(True)
             bus.pause(0.2)
-            bus.verify("LAS:OUT?", 1, "LAS ON acknowledge failed.")
+            bus.verify_laser(1, "LAS ON acknowledge failed.")
             self.events.on_live_output(bus.idx, "LAS", "ON")
             bus.pause(2.5)  # mandatory safety lock delay
             has_err, err = bus.check_errors()
@@ -400,7 +425,7 @@ class Sequencer:
         self.ramp_current(bus, plan.i_target, i_ramp)
 
     def _stage_finalize(self, bus, plan, t_ramp, i_ramp, t_off):
-        if not self.ctl.is_stop_requested:
+        if not self.driver.is_stop_requested:
             self.final_check(bus)
 
     # ----------------------------------------------------
@@ -416,11 +441,11 @@ class Sequencer:
 
     def _validate_limits(self, bus, plan):
         try:
-            h_i_lim = float(bus.query("LAS:LIM:I?"))
+            h_i_lim = bus.current_limit()
         except Exception:
             h_i_lim = 500.0
         try:
-            h_t_lim = float(bus.query("TEC:LIM:THI?"))
+            h_t_lim = bus.temp_limit()
         except Exception:
             h_t_lim = 80.0
         if plan.tec_cmd == "ON" and not math.isnan(h_t_lim) and plan.t_target > h_t_lim:
@@ -434,26 +459,27 @@ class Sequencer:
         chan_curr = -1
         for _ in range(3):
             try:
-                chan_curr = int(bus.query("CHAN?"))
+                chan_curr = bus.active_channel()
                 if chan_curr == bus.ch_num:
                     break
             except Exception:
                 pass
             bus.pause(0.15)
-            bus.cmd_pause(f"CHAN {bus.ch_num}")
+            bus.select()
+            bus.pause(0.15)
         if chan_curr != bus.ch_num:
             raise RuntimeError(f"Ch. switch to {bus.ch_num} timed out or failed.")
-        bus.cmd_pause("LAS:MOD 0")
-        bus.pause(0.1)
-        bus.verify("LAS:MOD?", 0, "Hardware failed to disable external modulation.")
+        bus.disable_modulation()
+        bus.pause(0.25)
+        bus.verify_modulation_off("Hardware failed to disable external modulation.")
 
     def _read_states(self, bus):
         try:
-            tec = int(float(bus.query("TEC:OUT?")))
+            tec = bus.tec_output()
         except Exception:
             tec = -1
         try:
-            las = int(float(bus.query("LAS:OUT?")))
+            las = bus.laser_output()
         except Exception:
             las = -1
         return tec, las
@@ -462,9 +488,9 @@ class Sequencer:
         self.events.on_status(bus.idx, "CRITICAL: Laser ON without TEC. Ramping down safely.", C_FAULT)
         self.ramp_current(bus, 0.0, i_ramp)
         bus.pause(0.15)
-        bus.send("LAS:OUTPUT 0")
+        bus.set_laser(False)
         bus.pause(0.2)
-        bus.verify("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
+        bus.verify_laser(0, "LAS OFF acknowledge failed.")
         self.events.on_live_output(bus.idx, "LAS", "OFF")
         raise RuntimeError(f"CRITICAL FAULT CH {bus.ch_num}: Laser ON while TEC OFF. Ramped down laser safely.")
 
@@ -483,9 +509,9 @@ class Sequencer:
             if tec_on_off == "ON" and las_on_off == "OFF":
                 self.tec_temp_tset_tcurr(bus)
                 bus.pause(0.15)
-                bus.send("TEC:OUTPUT 1")
+                bus.set_tec(True)
                 bus.pause(0.2)
-                bus.verify("TEC:OUT?", 1, "TEC ON acknowledge failed.")
+                bus.verify_tec(1, "TEC ON acknowledge failed.")
                 self.events.on_live_output(idx, "TEC", "ON")
                 bus.pause(0.15)
                 self.ramp_temp(bus, t_on_target, t_ramp)
@@ -493,19 +519,19 @@ class Sequencer:
             elif tec_on_off == "ON" and las_on_off == "ON":
                 self.tec_temp_tset_tcurr(bus)
                 bus.pause(0.15)
-                bus.send("TEC:OUTPUT 1")
+                bus.set_tec(True)
                 bus.pause(0.2)
-                bus.verify("TEC:OUT?", 1, "TEC ON acknowledge failed.")
+                bus.verify_tec(1, "TEC ON acknowledge failed.")
                 self.events.on_live_output(idx, "TEC", "ON")
                 bus.pause(0.15)
                 self.ramp_temp(bus, t_on_target, t_ramp)
 
                 bus.pause(0.15)
-                bus.send("LAS:LDI 0.0")
+                bus.set_current_setpoint(0.0)
                 bus.pause(0.15)
-                bus.send("LAS:OUTPUT 1")
+                bus.set_laser(True)
                 bus.pause(0.2)
-                bus.verify("LAS:OUT?", 1, "LAS ON acknowledge failed.")
+                bus.verify_laser(1, "LAS ON acknowledge failed.")
                 self.events.on_live_output(idx, "LAS", "ON")
                 bus.pause(2.5)  # Mandatory safety lock delay
 
@@ -520,11 +546,11 @@ class Sequencer:
                 self.ramp_temp(bus, t_on_target, t_ramp)
                 bus.pause(0.15)
 
-                bus.send("LAS:LDI 0.0")
+                bus.set_current_setpoint(0.0)
                 bus.pause(0.15)
-                bus.send("LAS:OUTPUT 1")
+                bus.set_laser(True)
                 bus.pause(0.2)
-                bus.verify("LAS:OUT?", 1, "LAS ON acknowledge failed.")
+                bus.verify_laser(1, "LAS ON acknowledge failed.")
                 self.events.on_live_output(idx, "LAS", "ON")
                 bus.pause(0.5)
 
@@ -537,9 +563,9 @@ class Sequencer:
             elif tec_on_off == "OFF" and las_on_off == "OFF":
                 self.ramp_temp(bus, t_off_target, t_ramp)
                 bus.pause(0.15)
-                bus.send("TEC:OUTPUT 0")
+                bus.set_tec(False)
                 bus.pause(0.2)
-                bus.verify("TEC:OUT?", 0, "TEC OFF acknowledge failed.")
+                bus.verify_tec(0, "TEC OFF acknowledge failed.")
                 self.events.on_live_output(idx, "TEC", "OFF")
                 bus.pause(0.5)
 
@@ -550,9 +576,9 @@ class Sequencer:
             if tec_on_off == "ON" and las_on_off == "OFF":
                 self.ramp_current(bus, 0.0, i_ramp)
                 bus.pause(0.15)
-                bus.send("LAS:OUTPUT 0")
+                bus.set_laser(False)
                 bus.pause(0.2)
-                bus.verify("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
+                bus.verify_laser(0, "LAS OFF acknowledge failed.")
                 self.events.on_live_output(idx, "LAS", "OFF")
                 bus.pause(0.5)
                 self.ramp_temp(bus, t_on_target, t_ramp)
@@ -560,16 +586,16 @@ class Sequencer:
             elif tec_on_off == "OFF" and las_on_off == "OFF":
                 self.ramp_current(bus, 0.0, i_ramp)
                 bus.pause(0.15)
-                bus.send("LAS:OUTPUT 0")
+                bus.set_laser(False)
                 bus.pause(0.2)
-                bus.verify("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
+                bus.verify_laser(0, "LAS OFF acknowledge failed.")
                 self.events.on_live_output(idx, "LAS", "OFF")
                 bus.pause(1.0)
                 self.ramp_temp(bus, t_off_target, t_ramp)
                 bus.pause(0.15)
-                bus.send("TEC:OUTPUT 0")
+                bus.set_tec(False)
                 bus.pause(0.2)
-                bus.verify("TEC:OUT?", 0, "TEC OFF acknowledge failed.")
+                bus.verify_tec(0, "TEC OFF acknowledge failed.")
                 self.events.on_live_output(idx, "TEC", "OFF")
                 bus.pause(0.5)
 
@@ -581,22 +607,21 @@ class Sequencer:
             if tec_curr_status == 0 and las_curr_status == 1:
                 self._critical_laser_without_tec(bus, i_ramp)
             else:
-                # Reached only when TEC/LAS output status could not be determined.
-                # Fail loud rather than silently skipping: for laser safety we must
-                # not proceed with an unknown output state.
+                # TEC/LAS output state could not be determined; fail loud rather
+                # than proceeding with an unknown output state.
                 raise RuntimeError(
                     f"Could not read TEC/LAS output state for Ch {ch_num} "
                     f"(TEC={tec_curr_status}, LAS={las_curr_status}). Aborting for safety.")
 
-        if not self.ctl.is_stop_requested:
+        if not self.driver.is_stop_requested:
             self.final_check(bus)
 
     def tec_temp_tset_tcurr(self, bus):
-        t_curr_str = bus.query("TEC:T?")
         try:
-            t_curr = float(t_curr_str)
+            t_curr = bus.temp_setpoint()
             if not math.isnan(t_curr):
-                bus.cmd_pause(f"TEC:T {t_curr:.2f}")
+                bus.set_temp_setpoint(t_curr)
+                bus.pause(0.15)
         except Exception:
             pass
 
@@ -607,9 +632,8 @@ class Sequencer:
         idx = bus.idx
         t_curr = None
         for _ in range(5):
-            t_curr_str = bus.query("TEC:SYNCT?")
             try:
-                t_curr = float(t_curr_str)
+                t_curr = bus.temperature()
                 break
             except Exception:
                 bus.pause(0.15)
@@ -631,7 +655,7 @@ class Sequencer:
 
         t_fail_count = 0
         while abs(t_set - t_target) > 0.01:
-            if self.ctl.is_stop_requested:
+            if self.driver.is_stop_requested:
                 raise RuntimeError("HALT")
 
             now = time.time()
@@ -643,16 +667,15 @@ class Sequencer:
             if (direction > 0 and t_set > t_target) or (direction < 0 and t_set < t_target):
                 t_set = t_target
 
-            bus.send(f"TEC:T {t_set:.2f}")
+            bus.set_temp_setpoint(t_set)
 
             p_start = time.time()
             while time.time() - p_start < 0.5:
                 self.events.on_tick()
                 bus.pause(0.1)
 
-            t_curr_str = bus.query("TEC:SYNCT?")
             try:
-                t_curr = float(t_curr_str)
+                t_curr = bus.temperature()
                 if math.isnan(t_curr):
                     raise ValueError("NaN")
                 t_fail_count = 0
@@ -673,9 +696,8 @@ class Sequencer:
         idx = bus.idx
         i_curr = None
         for _ in range(5):
-            i_curr_str = bus.query("LAS:SYNCLDI?")
             try:
-                i_curr = float(i_curr_str)
+                i_curr = bus.current()
                 break
             except Exception:
                 bus.pause(0.15)
@@ -695,7 +717,7 @@ class Sequencer:
 
         i_fail_count = 0
         while abs(i_set - i_target) > 0.01:
-            if self.ctl.is_stop_requested:
+            if self.driver.is_stop_requested:
                 raise RuntimeError("HALT")
 
             now = time.time()
@@ -707,16 +729,15 @@ class Sequencer:
             if (direction > 0 and i_set > i_target) or (direction < 0 and i_set < i_target):
                 i_set = i_target
 
-            bus.send(f"LAS:LDI {i_set:.2f}")
+            bus.set_current_setpoint(i_set)
 
             p_start = time.time()
             while time.time() - p_start < 0.5:
                 self.events.on_tick()
                 bus.pause(0.1)
 
-            i_curr_str = bus.query("LAS:SYNCLDI?")
             try:
-                i_curr = float(i_curr_str)
+                i_curr = bus.current()
                 if math.isnan(i_curr):
                     raise ValueError("NaN")
                 i_fail_count = 0
@@ -736,11 +757,11 @@ class Sequencer:
     def final_check(self, bus):
         idx = bus.idx
         try:
-            tec_stat = int(float(bus.query("TEC:OUT?")))
+            tec_stat = bus.tec_output()
         except Exception:
             tec_stat = -1
         try:
-            las_stat = int(float(bus.query("LAS:OUT?")))
+            las_stat = bus.laser_output()
         except Exception:
             las_stat = -1
 
@@ -762,4 +783,5 @@ class Sequencer:
         self.events.on_status(idx, status_str, C_OK)
         self.events.on_led(idx, LED_OK)
 
-        bus.cmd_pause("LAS:MOD 1")
+        bus.enable_modulation()
+        bus.pause(0.15)

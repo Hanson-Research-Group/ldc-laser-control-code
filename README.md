@@ -1,16 +1,18 @@
-# Newport LDC-3908 Modular Laser Diode Controller Software
+# Laser Controller Console
 
-A graphical desktop control suite for the **Newport LDC-3908 Modular Laser Diode Controller**. This software provides scientists and engineers with an intuitive, unified interface to configure, monitor, and safely ramp multi-laser setups.
+A graphical desktop **control console for laser diode controllers** — the instruments that drive and temperature-stabilize laser diodes. This is control *software*; it talks to the controller hardware, it is not the controller itself. It gives scientists and engineers a unified interface to configure, monitor, and safely ramp multi-laser setups: laser sources, laser-amplifier pump diodes, BBO/crystal heaters, and any other load managed through a supported controller's TEC and current channels.
+
+> **Supported hardware:** the only controller supported today is the **ILX Lightwave LDC-3908** modular laser diode controller. The code is organized behind a device-agnostic driver so support for other controllers can be added without touching the GUI or the safety engine — see [Adding a controller](#-adding-another-controller).
 
 ---
 
 ## 🚀 Key Features
 
-*   **Multi-Channel Grid System**: Direct configuration and monitoring for up to **8 independent laser controller cards** simultaneously.
+*   **Multi-Channel Grid System**: Direct configuration and monitoring for up to **8 independent controller channels** simultaneously.
 *   **Real-Time Telemetry Monitor**: A high-efficiency background timer thread continuously queries active slots every 2.0 seconds to stream real-time Temperature (°C), Current (mA), and output statuses without locking the UI.
 *   **Automated Safety Ramping**: Implements precise, linear, and gradual software ramping algorithms for temperature ($\Delta T/\text{s}$) and current ($\Delta I/\text{s}$) to safeguard delicate laser diodes against thermal shock and current spikes.
-*   **Automated Chassis Interrogation**: Instantly interrogates the Newport mainframe slot-by-slot to discover active laser cards, read hardware-level limits (max current, max temperature), and match UI controls accordingly.
-*   **Master Controls**: Global overrides to toggle all TEC or Laser modules ON/OFF in a single click, alongside master ramping triggers.
+*   **Automated Chassis Interrogation**: Instantly interrogates the controller slot-by-slot to discover active channels, read hardware-level limits (max current, max temperature), and match UI controls accordingly.
+*   **Master Controls**: Global overrides to toggle all TEC or Laser channels ON/OFF in a single click, alongside master ramping triggers.
 *   **Flexible Profile Management**: Save and load complete multi-laser experimental profiles as pretty-printed, human-editable JSON-encoded configuration files. Includes an automatic unsaved change indicator (`*`) and auto-loads the last active profile on startup.
 *   **Built-in Hardware Simulator**: Includes a headless, software-defined **Demo Simulator** to mimic active cards, telemetry, and ramping responses, enabling offline dry-runs and validation without physical hardware.
 *   **Double-Safeguarded Shutoffs**:
@@ -34,15 +36,16 @@ A graphical desktop control suite for the **Newport LDC-3908 Modular Laser Diode
 ## 📂 Repository Directory Layout
 
 ```
-ldc-laser-control-code/
+laser-controller-console/
 ├── profiles/                  # Laser configuration profiles (JSON)
 │   └── template_profile.txt       # Example profile to copy and edit
 ├── src/                       # Source code
-│   ├── main.py                    # PySide6/Qt GUI entry point
-│   ├── laser_controller.py        # UI-agnostic hardware/protocol core + simulator
+│   ├── main.py                    # PySide6/Qt GUI entry point (device-agnostic)
+│   ├── driver.py                  # Abstract controller-driver interface
+│   ├── ldc3908.py                 # ILX Lightwave LDC-3908 driver + Demo Simulator
 │   ├── sequencer.py               # Safety state machine + ramp engine
 │   ├── theme.py                   # Light/dark theme tokens
-│   ├── test_laser_controller.py   # Head-less core tests
+│   ├── test_ldc3908.py            # Head-less driver tests
 │   ├── test_sequencer.py          # Head-less sequencer tests
 │   ├── test_gui.py                # Head-less GUI smoke test (offscreen)
 │   ├── laser_controller_icon.ico  # Application icon
@@ -53,16 +56,16 @@ ldc-laser-control-code/
 └── README.md
 ```
 
-> **Hardware manuals:** the Newport **LDC-3908** and **LDC-3916370** user manuals are
-> not distributed here — download them from [Newport](https://www.newport.com/) for the
-> full SCPI command reference and chassis configuration details.
+> **Hardware manuals:** the ILX Lightwave **LDC-3908** / **LDC-3916370** user manuals are
+> not distributed here — download them from the manufacturer for the full SCPI command
+> reference and chassis configuration details.
 
 ---
 
 ## 🔌 Hardware Setup & Interfacing
 
-### Mainframe Serial Settings
-The mainframe communicates over a standard RS-232 serial interface. Verify the following parameters on the Newport LDC-3908 physical chassis (**Config -> Comm Menu**):
+### Controller Serial Settings
+The ILX Lightwave LDC-3908 communicates over a standard RS-232 serial interface. Verify the following parameters on the controller's front panel (**Config → Comm Menu**):
 *   **Baud Rate**: `9600`
 *   **Data Bits**: `8`
 *   **Parity**: `None`
@@ -70,7 +73,7 @@ The mainframe communicates over a standard RS-232 serial interface. Verify the f
 *   **Terminator**: Line Feed (`LF` or `\n`)
 
 ### Connecting to the Host
-1. Connect the Newport LDC-3908 RS-232 port to the host PC using a null-modem cable or USB-to-RS232 adapter.
+1. Connect the controller's RS-232 port to the host PC using a null-modem cable or USB-to-RS232 adapter.
 2. Run the application by executing `python src/main.py` from the project root.
 3. In the **COM Port** dropdown, select the corresponding serial port detected on your Windows USB stack (e.g., `COM3`).
 4. Click **Connect**. If the physical hardware is unavailable, select **Demo Simulator** to explore the software's capabilities safely in virtual space.
@@ -115,29 +118,41 @@ Experimental configurations are serialized into standard JSON text files, making
   "T_ramp": 0.1,
   "I_ramp": 0.5,
   "T_OFF_Target": 22.0,
+  "Ramp_Mode": "sequential",
+  "View_Mode": "table",
   "channels": [
-    { "T_Target": 35.0, "I_Target": 40.0, "Label": "D1-Xenon Pump" },
-    { "T_Target": 33.0, "I_Target": 30.0, "Label": "D2-Xenon Probe" },
+    { "T_Target": 35.0, "I_Target": 40.0, "Label": "Pump diode 1" },
+    { "T_Target": 33.0, "I_Target": 30.0, "Label": "Pump diode 2" },
     { "T_Target": 22.0, "I_Target": 0.0,  "Label": "Laser 3" }
   ]
 }
 ```
 
-*   **Saving Profiles**: Modify parameters in the GUI and click **💾 Save Profile**. Unsaved changes will prepend a warning asterisk (`*`) to the active profile name.
+*   **Saving Profiles**: Modify parameters in the GUI and click **💾 Save Profile**. Unsaved changes will prepend a warning asterisk (`*`) to the active profile name. The chosen ramp mode and Table/Cards view are saved with the profile.
 *   **Loading Profiles**: Click **📂 Load Profile** and select your configuration. The GUI will perform integrity checks to ensure channel alignment.
 
 ---
 
 ## 🛠️ Software Architecture
 
-The hardware/protocol and safety-critical control logic live in a UI-agnostic core, independent of any GUI toolkit:
+The control logic is split into UI-agnostic, device-agnostic layers so the GUI, the safety engine, and the hardware protocol are independent of one another:
 
-*   `laser_controller.py` — serial I/O, the Demo Simulator, and safety helpers (read-back verification, cooperative halt, `MODERR?` parsing).
-*   `sequencer.py` — the per-channel safety state machine and the temperature/current ramps. It drives the controller and reports back through a `SequenceEvents` sink instead of touching any widgets.
+*   `driver.py` — the abstract `LaserControllerDriver` interface: a small set of *semantic* operations (`select_channel`, `set_tec`, `set_temp_setpoint`, `read_errors`, …). The engine and GUI talk only to this interface and never see a raw device command.
+*   `ldc3908.py` — the concrete `LDC3908Driver` for the ILX Lightwave LDC-3908: it maps each semantic operation onto the LDC-3908 SCPI command set and ships the built-in Demo Simulator.
+*   `sequencer.py` — the per-channel safety state machine and the temperature/current ramps (sequential / all-temps-then-currents / parallel). It drives the controller through a driver and reports back through a `SequenceEvents` sink instead of touching any widgets.
 
-This core is exercised by head-less unit tests (`test_laser_controller.py`, `test_sequencer.py`) that run with no display.
+This core is exercised by head-less unit tests (`test_ldc3908.py`, `test_sequencer.py`) that run with no display.
 
 The GUI (`main.py`) is built with **PySide6 / Qt** (`pip install PySide6`): a responsive Table/Cards channel view with auto-hide of unused channels, OS-following light/dark theme, and profile management. Worker-thread updates reach the GUI through Qt signals, so telemetry queries and sequence ramps run on background threads without locking the UI. It is smoke-tested head-less by `test_gui.py`.
+
+### ➕ Adding another controller
+
+Support for a different controller is a matter of writing one new driver — no changes to the engine or the GUI:
+
+1. Subclass `LaserControllerDriver` (in `driver.py`) in a new module and implement the semantic device operations plus, if you want offline testing, the `_sim_*` simulator hooks. `ldc3908.py` is a complete worked example.
+2. Set the driver on the GUI by pointing `DRIVER_CLASS` in `main.py` at your new class.
+
+Because the interface is semantic (not command-string based), a driver for a non-SCPI or non-serial controller can also override the transport methods (`open`/`close`/`_write`/`_read`/`_query`).
 
 ---
 
@@ -152,7 +167,7 @@ A standalone Windows executable is compiled and distributed using PyInstaller fo
 
 ### How to Run:
 1. Go to the **Releases** section of this repository.
-2. Download `LDC3908_ModularLaserDiodeControllerSoftware.exe` from the latest release.
+2. Download `LaserControllerConsole.exe` from the latest release.
 3. Run the executable on any Windows 10/11 PC.
 
 ---
@@ -162,13 +177,12 @@ A standalone Windows executable is compiled and distributed using PyInstaller fo
 This software controls real laser hardware. It is provided **"as is", without warranty of
 any kind** (see [LICENSE](LICENSE)). The authors accept no liability for equipment damage or
 injury. You are responsible for the safe operation of your lasers: verify limits, keep the key
-interlock and protective eyewear in place, and **validate the software against your own chassis**
+interlock and protective eyewear in place, and **validate the software against your own controller**
 (especially the parallel/stage ramp modes) before relying on it. Not affiliated with or endorsed
-by Newport Corporation.
+by any hardware manufacturer.
 
 ---
 
 ## 📄 License
 
 Released under the [MIT License](LICENSE). Contributions and use by other labs are welcome.
-

@@ -11,7 +11,7 @@ or under pytest:
 
 import time
 
-from laser_controller import LaserController
+from ldc3908 import LDC3908Driver
 from sequencer import Sequencer, SequenceEvents, ChannelPlan, estimate_run_times
 
 
@@ -46,7 +46,7 @@ class RecordingEvents(SequenceEvents):
 
 
 def _rig():
-    c = LaserController()
+    c = LDC3908Driver()
     c.open_simulator()
     ev = RecordingEvents()
     seq = Sequencer(c, ev)

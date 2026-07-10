@@ -11,7 +11,7 @@ def build_exe():
         'src/main.py',
         '--onefile',
         '--noconsole',
-        '--name=LDC3908_ModularLaserDiodeControllerSoftware',
+        '--name=LaserControllerConsole',
         f'--add-data=src/laser_controller_icon.png{os.pathsep}src/',
         f'--add-data=src/laser_controller_icon.ico{os.pathsep}src/',
         '--icon=src/laser_controller_icon.ico'
@@ -26,7 +26,7 @@ def build_exe():
     print("PyInstaller build finished.")
     
     # Verify binary exists
-    exe_name = "LDC3908_ModularLaserDiodeControllerSoftware.exe"
+    exe_name = "LaserControllerConsole.exe"
     exe_path = os.path.join("dist", exe_name)
     if os.path.exists(exe_path):
         print(f"Success! Executable built at: {os.path.abspath(exe_path)}")

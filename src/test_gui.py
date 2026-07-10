@@ -65,10 +65,10 @@ def run():
         if w.is_executing:
             QTimer.singleShot(200, wait_run)
             return
-        res['tec'] = w.ctl.sim_state['TEC_ON'][0]
-        res['las'] = w.ctl.sim_state['LAS_ON'][0]
-        res['T'] = round(w.ctl.sim_state['T_actual'][0], 2)
-        res['I'] = round(w.ctl.sim_state['I_actual'][0], 2)
+        res['tec'] = w.driver.sim_state['TEC_ON'][0]
+        res['las'] = w.driver.sim_state['LAS_ON'][0]
+        res['T'] = round(w.driver.sim_state['T_actual'][0], 2)
+        res['I'] = round(w.driver.sim_state['I_actual'][0], 2)
         res['status'] = w.cards[0].status.text()
         app.quit()
 
