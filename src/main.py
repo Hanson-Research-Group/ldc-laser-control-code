@@ -315,6 +315,11 @@ class LDCControllerApp(ctk.CTk):
         right = ctk.CTkFrame(bar, fg_color="transparent")
         right.grid(row=0, column=2, sticky="e")
 
+        self.view_toggle = ctk.CTkSegmentedButton(right, values=["Table", "Cards"],
+                                                  width=140, command=self._set_view_mode)
+        self.view_toggle.set("Table")
+        self.view_toggle.pack(side="left", padx=(0, 14))
+
         self.show_unused_var = tk.BooleanVar(value=False)
         self.chk_show_unused = ctk.CTkSwitch(right, text="Show unused", variable=self.show_unused_var,
                                              command=lambda: self._reflow_cards(force=True))
@@ -353,6 +358,12 @@ class LDCControllerApp(ctk.CTk):
         self.ch_ui = []
         for i in range(self.num_channels):
             self.ch_ui.append(self._build_channel_card(i))
+
+        # Default to Table view (full-width stacked rows under a shared header).
+        self._build_table_header()
+        self._table_mode = True
+        for ch in self.ch_ui:
+            self._layout_table_row(ch)
 
         # Reflow on window resize; prime once geometry settles.
         self.bind("<Configure>", self._reflow_cards)
@@ -422,107 +433,149 @@ class LDCControllerApp(ctk.CTk):
     # ----------------------------------------------------
     # CHANNEL CARD LAYOUT (responsive reflow)
     # ----------------------------------------------------
-    def _build_channel_card(self, i):
-        """Create one channel's card. Returns the ch_ui dict with the SAME keys the
-        scan/telemetry/sequence code expects, plus 'card' (the frame itself)."""
-        ch_idx = i + 1
-        card = ctk.CTkFrame(self.cards_container, corner_radius=10, border_width=1,
-                            border_color=("#d0d0d0", "#3f3f3f"))
-        for c in range(4):
-            card.grid_columnconfigure(c, weight=1, uniform="cardcol")
+    # Column spec for Table view (and its header): (title, min logical width, weight).
+    # Index == grid column. The Status column stretches to absorb extra width.
+    _TABLE_COLS = [
+        ("Ch", 44, 0), ("En", 30, 0), ("Label", 120, 0), ("", 24, 0), ("Status", 150, 1),
+        ("Live TEC", 62, 0), ("Live LAS", 62, 0), ("Live T", 62, 0), ("Live I", 62, 0),
+        ("TEC", 62, 0), ("LAS", 62, 0), ("Tgt T", 58, 0), ("Max", 40, 0),
+        ("Tgt I", 58, 0), ("Max", 40, 0), ("Action", 92, 0),
+    ]
 
+    def _build_channel_card(self, i):
+        """Create one channel's widgets inside a card frame. Returns the ch_ui dict
+        with the SAME keys the scan/telemetry/sequence code expects, plus 'card' (the
+        frame) and '_caps' (compact-view caption labels). The widgets are NOT gridded
+        here — _layout_compact()/_layout_table_row() arrange them per the view mode."""
+        ch_idx = i + 1
+        card = ctk.CTkFrame(self.cards_container, corner_radius=8, border_width=1,
+                            border_color=("#d0d0d0", "#3f3f3f"))
         muted = theme.status("muted")
 
-        def caption(text, col, row):
-            ctk.CTkLabel(card, text=text, font=("Segoe UI", 11), text_color=muted).grid(
-                row=row, column=col, padx=2, pady=(6, 0), sticky="s")
+        caps = []  # (widget, compact_col, compact_row, sticky) — shown only in card view
 
-        # Header: channel number, label, enable
+        def cap(text, col, row, sticky="s"):
+            lbl = ctk.CTkLabel(card, text=text, font=("Segoe UI", 11), text_color=muted)
+            caps.append((lbl, col, row, sticky))
+            return lbl
+
         lbl_ch = ctk.CTkLabel(card, text=f"Ch {ch_idx}", font=("Segoe UI", 15, "bold"))
-        lbl_ch.grid(row=0, column=0, padx=(10, 4), pady=(8, 2), sticky="w")
-
         ent_label = ctk.CTkEntry(card, placeholder_text=f"Laser {ch_idx}", state="disabled")
         ent_label.insert(0, f"Laser {ch_idx}")
-        ent_label.grid(row=0, column=1, columnspan=2, padx=4, pady=(8, 2), sticky="ew")
         ent_label.bind("<KeyRelease>", self.mark_profile_unsaved)
-
         var_enable = tk.BooleanVar(value=False)
         chk_enable = ctk.CTkCheckBox(card, text="", width=24, variable=var_enable,
                                      state="disabled", command=self._on_enable_toggle)
-        chk_enable.grid(row=0, column=3, padx=(4, 10), pady=(8, 2), sticky="e")
-
-        # Status row: LED + status text
         led = LEDIndicator(card, size=18, color=theme.led("idle"))
-        led.grid(row=1, column=0, padx=(10, 4), pady=2, sticky="w")
         lbl_status = ctk.CTkLabel(card, text="Run Scan First", text_color=muted,
                                   font=("Segoe UI", 14), anchor="w")
-        lbl_status.grid(row=1, column=1, columnspan=3, padx=4, pady=2, sticky="ew")
 
-        # Live readouts
-        caption("Live TEC", 0, 2); caption("Live LAS", 1, 2)
-        caption("Live T °C", 2, 2); caption("Live I mA", 3, 2)
+        cap("Live TEC", 0, 2); cap("Live LAS", 1, 2); cap("Live T °C", 2, 2); cap("Live I mA", 3, 2)
         ent_live_tec = ctk.CTkEntry(card, width=72, state="disabled", font=("Segoe UI", 13, "bold"),
                                     justify="center", fg_color=theme.LIVE_IDLE_BG, text_color=theme.LIVE_IDLE_TEXT)
-        set_entry_val(ent_live_tec, "OFF"); ent_live_tec.grid(row=3, column=0, padx=2, pady=2, sticky="ew")
+        set_entry_val(ent_live_tec, "OFF")
         ent_live_las = ctk.CTkEntry(card, width=72, state="disabled", font=("Segoe UI", 13, "bold"),
                                     justify="center", fg_color=theme.LIVE_IDLE_BG, text_color=theme.LIVE_IDLE_TEXT)
-        set_entry_val(ent_live_las, "OFF"); ent_live_las.grid(row=3, column=1, padx=2, pady=2, sticky="ew")
+        set_entry_val(ent_live_las, "OFF")
         ent_live_t = ctk.CTkEntry(card, width=72, state="disabled", font=("Segoe UI", 16), justify="right")
-        set_entry_val(ent_live_t, "0.0"); ent_live_t.grid(row=3, column=2, padx=2, pady=2, sticky="ew")
+        set_entry_val(ent_live_t, "0.0")
         ent_live_i = ctk.CTkEntry(card, width=72, state="disabled", font=("Segoe UI", 16), justify="right")
-        set_entry_val(ent_live_i, "0.0"); ent_live_i.grid(row=3, column=3, padx=2, pady=2, sticky="ew")
+        set_entry_val(ent_live_i, "0.0")
 
-        # Target controls
-        caption("TEC", 0, 4); caption("LAS", 1, 4)
-        caption("Target T", 2, 4); caption("Target I", 3, 4)
+        cap("TEC", 0, 4); cap("LAS", 1, 4); cap("Target T", 2, 4); cap("Target I", 3, 4)
         opt_tec = ctk.CTkOptionMenu(card, values=["ON", "OFF"], width=72, state="disabled",
                                     command=self.mark_profile_unsaved)
-        opt_tec.set("OFF"); opt_tec.grid(row=5, column=0, padx=2, pady=2, sticky="ew")
+        opt_tec.set("OFF")
         opt_las = ctk.CTkOptionMenu(card, values=["ON", "OFF"], width=72, state="disabled",
                                     command=self.mark_profile_unsaved)
-        opt_las.set("OFF"); opt_las.grid(row=5, column=1, padx=2, pady=2, sticky="ew")
+        opt_las.set("OFF")
         ent_target_t = ctk.CTkEntry(card, width=72, state="disabled", justify="right")
-        ent_target_t.insert(0, "22.0"); ent_target_t.grid(row=5, column=2, padx=2, pady=2, sticky="ew")
+        ent_target_t.insert(0, "22.0")
         ent_target_t.bind("<KeyRelease>", self.mark_profile_unsaved)
         ent_target_t.bind("<FocusOut>", lambda e, w=ent_target_t: self._validate_numeric_entry(w))
         ent_target_i = ctk.CTkEntry(card, width=72, state="disabled", justify="right")
-        ent_target_i.insert(0, "0.0"); ent_target_i.grid(row=5, column=3, padx=2, pady=2, sticky="ew")
+        ent_target_i.insert(0, "0.0")
         ent_target_i.bind("<KeyRelease>", self.mark_profile_unsaved)
         ent_target_i.bind("<FocusOut>", lambda e, w=ent_target_i: self._validate_numeric_entry(w))
 
-        # Hardware limits
-        ctk.CTkLabel(card, text="Max limit:", font=("Segoe UI", 11), text_color=muted).grid(
-            row=6, column=1, padx=2, pady=(0, 2), sticky="e")
+        cap("Max limit:", 1, 6, sticky="e")
         lbl_max_t = ctk.CTkLabel(card, text="-", font=("Segoe UI", 13), text_color=muted)
-        lbl_max_t.grid(row=6, column=2, padx=2, pady=(0, 2))
         lbl_max_i = ctk.CTkLabel(card, text="-", font=("Segoe UI", 13), text_color=muted)
-        lbl_max_i.grid(row=6, column=3, padx=2, pady=(0, 2))
 
-        # Run button
-        btn_run_ch = ctk.CTkButton(card, text="▶ Run Ch.", state="disabled",
+        btn_run_ch = ctk.CTkButton(card, text="▶ Run Ch.", width=92, state="disabled",
                                    command=lambda ch=ch_idx: self.execute_single_channel(ch))
-        btn_run_ch.grid(row=7, column=0, columnspan=4, padx=10, pady=(6, 10), sticky="ew")
 
         return {
-            'card': card,
-            'label_num': lbl_ch,
-            'enable_var': var_enable,
-            'enable_chk': chk_enable,
-            'laser_label': ent_label,
-            'led': led,
-            'status': lbl_status,
-            'live_tec': ent_live_tec,
-            'live_las': ent_live_las,
-            'cur_t': ent_live_t,
-            'cur_i': ent_live_i,
-            'tec_cmd': opt_tec,
-            'las_cmd': opt_las,
-            't_target': ent_target_t,
-            't_lim': lbl_max_t,
-            'i_target': ent_target_i,
-            'i_lim': lbl_max_i,
-            'btn_exec': btn_run_ch,
+            'card': card, '_caps': caps,
+            'label_num': lbl_ch, 'enable_var': var_enable, 'enable_chk': chk_enable,
+            'laser_label': ent_label, 'led': led, 'status': lbl_status,
+            'live_tec': ent_live_tec, 'live_las': ent_live_las,
+            'cur_t': ent_live_t, 'cur_i': ent_live_i,
+            'tec_cmd': opt_tec, 'las_cmd': opt_las,
+            't_target': ent_target_t, 't_lim': lbl_max_t,
+            'i_target': ent_target_i, 'i_lim': lbl_max_i, 'btn_exec': btn_run_ch,
         }
+
+    def _clear_card_grid(self, card):
+        for w in card.grid_slaves():
+            w.grid_forget()
+
+    def _layout_compact(self, ch):
+        """Card view: a compact block, 4 internal columns."""
+        card = ch['card']
+        self._clear_card_grid(card)
+        for c in range(len(self._TABLE_COLS)):
+            card.grid_columnconfigure(c, weight=0, minsize=0)
+        for c in range(4):
+            card.grid_columnconfigure(c, weight=1, minsize=0)
+
+        ch['label_num'].grid(row=0, column=0, padx=(10, 4), pady=(8, 2), sticky="w")
+        ch['laser_label'].grid(row=0, column=1, columnspan=2, padx=4, pady=(8, 2), sticky="ew")
+        ch['enable_chk'].grid(row=0, column=3, padx=(4, 10), pady=(8, 2), sticky="e")
+        ch['led'].grid(row=1, column=0, padx=(10, 4), pady=2, sticky="w")
+        ch['status'].grid(row=1, column=1, columnspan=3, padx=4, pady=2, sticky="ew")
+        for lbl, col, row, sticky in ch['_caps']:
+            lbl.grid(row=row, column=col, padx=2, pady=(6, 0), sticky=sticky)
+        ch['live_tec'].grid(row=3, column=0, padx=2, pady=2, sticky="ew")
+        ch['live_las'].grid(row=3, column=1, padx=2, pady=2, sticky="ew")
+        ch['cur_t'].grid(row=3, column=2, padx=2, pady=2, sticky="ew")
+        ch['cur_i'].grid(row=3, column=3, padx=2, pady=2, sticky="ew")
+        ch['tec_cmd'].grid(row=5, column=0, padx=2, pady=2, sticky="ew")
+        ch['las_cmd'].grid(row=5, column=1, padx=2, pady=2, sticky="ew")
+        ch['t_target'].grid(row=5, column=2, padx=2, pady=2, sticky="ew")
+        ch['i_target'].grid(row=5, column=3, padx=2, pady=2, sticky="ew")
+        ch['t_lim'].grid(row=6, column=2, padx=2, pady=(0, 2))
+        ch['i_lim'].grid(row=6, column=3, padx=2, pady=(0, 2))
+        ch['btn_exec'].grid(row=7, column=0, columnspan=4, padx=10, pady=(6, 10), sticky="ew")
+
+    def _layout_table_row(self, ch):
+        """Table view: one full-width horizontal row, columns aligned with the header."""
+        card = ch['card']
+        self._clear_card_grid(card)
+        for c, (_, minsize, weight) in enumerate(self._TABLE_COLS):
+            card.grid_columnconfigure(c, minsize=minsize, weight=weight)
+
+        order = ['label_num', 'enable_chk', 'laser_label', 'led', 'status',
+                 'live_tec', 'live_las', 'cur_t', 'cur_i', 'tec_cmd', 'las_cmd',
+                 't_target', 't_lim', 'i_target', 'i_lim', 'btn_exec']
+        for col, key in enumerate(order):
+            sticky = "w" if key in ('label_num', 'status') else "ew"
+            ch[key].grid(row=0, column=col, padx=2, pady=4, sticky=sticky)
+
+    def _build_table_header(self):
+        """A single header row shown above the stacked channel rows in Table view."""
+        self.table_header = ctk.CTkFrame(self.cards_container, fg_color="transparent")
+        for c, (title, minsize, weight) in enumerate(self._TABLE_COLS):
+            self.table_header.grid_columnconfigure(c, minsize=minsize, weight=weight)
+            ctk.CTkLabel(self.table_header, text=title, font=("Segoe UI", 12, "bold"),
+                         anchor="w").grid(row=0, column=c, padx=2, pady=(2, 2), sticky="w")
+
+    def _set_view_mode(self, mode):
+        """Switch between 'Table' (full-width stacked rows) and 'Cards' (compact grid)."""
+        self._table_mode = (mode == "Table")
+        for ch in self.ch_ui:
+            (self._layout_table_row if self._table_mode else self._layout_compact)(ch)
+        self._reflow_cards(force=True)
 
     def _shown_indices(self):
         """Which channel cards should be visible right now. Before the first scan,
@@ -534,15 +587,30 @@ class LDCControllerApp(ctk.CTk):
                 if self.ch_populated[i] and self.ch_ui[i]['enable_var'].get()]
 
     def _reflow_cards(self, event=None, force=False):
-        """Grid the visible channel cards into as many columns as fit the current
-        width, so the layout reflows from a wide row down to a single column on a
-        laptop or quarter-screen window."""
+        """Place the visible channel cards. In Table view they stack full-width under
+        a shared header; in Cards view they reflow into as many columns as fit the
+        current width (down to one on a laptop / quarter-screen window)."""
         if not getattr(self, "ch_ui", None):
             return
-        # Use the scrollable frame's VIEWPORT width (its canvas). winfo_width is in
-        # physical pixels, but CTk widget widths are in logical units, so convert
-        # by the widget scaling factor (HiDPI displays scale by >1) before
-        # comparing to CARD_W.
+        shown = self._shown_indices()
+
+        if getattr(self, "_table_mode", True):
+            key = ("table", tuple(shown))
+            if not force and key == self._reflow_key:
+                return
+            self._reflow_key = key
+            for c in range(len(self._TABLE_COLS)):
+                self.cards_container.grid_columnconfigure(c, weight=(1 if c == 0 else 0), minsize=0)
+            for i in range(self.num_channels):
+                self.ch_ui[i]['card'].grid_forget()
+            self.table_header.grid(row=0, column=0, sticky="ew", padx=8, pady=(2, 0))
+            for pos, i in enumerate(shown):
+                self.ch_ui[i]['card'].grid(row=pos + 1, column=0, padx=8, pady=3, sticky="ew")
+            return
+
+        # Cards view: compute columns from the viewport width (physical px -> logical
+        # via the HiDPI widget-scaling factor).
+        self.table_header.grid_forget()
         canvas = getattr(self.cards_container, "_parent_canvas", None)
         px_width = canvas.winfo_width() if canvas is not None else self.cards_container.winfo_width()
         if px_width <= 1:
@@ -554,17 +622,15 @@ class LDCControllerApp(ctk.CTk):
             scaling = 1.0
         width = px_width / max(scaling, 0.1)
 
-        CARD_W = 360   # logical units; approx one card's width incl. padding
-        shown = self._shown_indices()
+        CARD_W = 360
         cols = max(1, min(int(width // CARD_W), max(1, len(shown))))
-
-        key = (cols, tuple(shown))
+        key = ("cards", cols, tuple(shown))
         if not force and key == self._reflow_key:
             return
         self._reflow_key = key
 
-        for c in range(self.num_channels):
-            self.cards_container.grid_columnconfigure(c, weight=(1 if c < cols else 0), uniform="cards")
+        for c in range(max(cols, len(self._TABLE_COLS))):
+            self.cards_container.grid_columnconfigure(c, weight=(1 if c < cols else 0), minsize=0)
         for i in range(self.num_channels):
             self.ch_ui[i]['card'].grid_forget()
         for pos, i in enumerate(shown):
