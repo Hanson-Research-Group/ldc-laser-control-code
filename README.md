@@ -1,6 +1,6 @@
 # Laser Controller Console
 
-A graphical desktop **control console for laser diode controllers** — the instruments that drive and temperature-stabilize laser diodes. This is control *software*; it talks to the controller hardware, it is not the controller itself. It gives scientists and engineers a unified interface to configure, monitor, and safely ramp multi-laser setups: laser sources, laser-amplifier pump diodes, BBO/crystal heaters, and any other load managed through a supported controller's TEC and current channels.
+A graphical desktop **control console for laser diode controllers** — the instruments that drive and temperature-stabilize laser diodes. It gives scientists and engineers a unified interface to configure, monitor, and safely ramp multi-laser setups: laser sources, laser-amplifier pump diodes, BBO/crystal heaters, and any other load managed through a supported controller's TEC and current channels.
 
 > **Supported hardware:** the only controller supported today is the **ILX Lightwave LDC-3908** modular laser diode controller. The code is organized behind a device-agnostic driver so support for other controllers can be added without touching the GUI or the safety engine — see [Adding a controller](#-adding-another-controller).
 
