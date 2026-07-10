@@ -14,18 +14,20 @@ import math
 import re
 import time
 
-from driver import LaserControllerDriver
+from driver import LaserControllerDriver, CAP_TEMPERATURE, CAP_CURRENT
 
 
 class LDC3908Driver(LaserControllerDriver):
     num_channels = 8
     baudrate = 9600
+    capabilities = frozenset({CAP_TEMPERATURE, CAP_CURRENT})  # combined T + I
+    model = "ILX Lightwave LDC-3908"
 
     # ILX Lightwave module error codes returned by MODERR?.
     KNOWN_ERROR_CODES = ["501", "504", "503", "505", "508", "511", "404", "407"]
 
-    def __init__(self, num_channels=8):
-        super().__init__(num_channels=num_channels)
+    def __init__(self, num_channels=8, stop=None):
+        super().__init__(num_channels=num_channels, stop=stop)
         self._sim_reset()
 
     # ------------------------------------------------------------------
@@ -211,8 +213,8 @@ class LDC3908Driver(LaserControllerDriver):
         err_str = ""
         codes = []
         for _ in range(3):
-            if not self.is_simulated and self.ser:
-                self.ser.reset_input_buffer()
+            if not self.is_simulated and self.transport is not None:
+                self.transport.flush_input()
             self._write("MODERR?")
             time.sleep(0.15)
             err_str = self._read().strip()
