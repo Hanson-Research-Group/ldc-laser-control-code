@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QComboBox, QLineEdit,
     QCheckBox, QFrame, QHBoxLayout, QVBoxLayout, QGridLayout, QMessageBox,
     QFileDialog, QScrollArea, QButtonGroup, QDialog, QDialogButtonBox, QFormLayout,
-    QListWidget, QInputDialog, QMenu,
+    QListWidget, QInputDialog, QMenu, QSizePolicy,
 )
 
 import serial.tools.list_ports
@@ -888,10 +888,35 @@ class LDCMainWindow(QMainWindow):
         pv.addLayout(mgrid)
         bottom.addWidget(preset)
 
-        self.btn_emo = QPushButton("⚠  EMO OFF"); self.btn_emo.setEnabled(False)
-        self.btn_emo.setFixedWidth(140); self.btn_emo.setMinimumHeight(92)
-        self.btn_emo.setStyleSheet("background:#b71c1c; color:white; font-size:14px; "
-                                   "font-weight:bold; border-radius:8px; padding:6px 8px;")
+        # Emergency button: a red block whose content is stacked labels (warning
+        # icon on its own line, the bold action phrase, then a lighter warning) so
+        # we can mix weights. The labels are click-transparent so the whole block
+        # still fires the button. It stretches to match the Run-All/Cancel stack.
+        self.btn_emo = QPushButton()
+        self.btn_emo.setEnabled(False)
+        self.btn_emo.setFixedWidth(150)
+        self.btn_emo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.btn_emo.setStyleSheet(
+            "QPushButton { background:#b71c1c; border-radius:8px; }"
+            "QPushButton:disabled { background:#6d3636; }")
+        emo_lay = QVBoxLayout(self.btn_emo)
+        emo_lay.setContentsMargins(8, 8, 8, 8); emo_lay.setSpacing(2)
+        emo_lay.addStretch(1)
+        emo_icon = QLabel("⚠"); emo_icon.setAlignment(Qt.AlignCenter)
+        emo_icon.setStyleSheet("color:white; font-size:22px; font-weight:bold; background:transparent;")
+        emo_title = QLabel("EMERGENCY LASER CURRENT OFF")
+        emo_title.setAlignment(Qt.AlignCenter); emo_title.setWordWrap(True)
+        emo_title.setStyleSheet("color:white; font-size:13px; font-weight:bold; background:transparent;")
+        emo_warn = QLabel("MAY DAMAGE LASER")
+        emo_warn.setAlignment(Qt.AlignCenter); emo_warn.setWordWrap(True)
+        emo_warn.setStyleSheet("color:white; font-size:11px; font-weight:normal; background:transparent;")
+        for _l in (emo_icon, emo_title, emo_warn):
+            _l.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        emo_lay.addWidget(emo_icon)
+        emo_lay.addWidget(emo_title)
+        emo_lay.addSpacing(6)
+        emo_lay.addWidget(emo_warn)
+        emo_lay.addStretch(1)
         self.btn_emo.setToolTip("EMERGENCY: immediately cut laser current on every channel, bypassing the\n"
                                 "ramp-down. Use only in a genuine emergency — for normal stops use Cancel Run.")
         self.btn_emo.clicked.connect(self.emergency_las_off)
