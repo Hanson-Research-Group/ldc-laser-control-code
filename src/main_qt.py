@@ -80,6 +80,7 @@ def build_stylesheet(dark):
     field_border = "#464b52" if dark else "#c4c8cd"
     header_bg = "#26292d" if dark else "#eef0f2"
     muted = "#9aa0a6" if dark else "#6b7075"
+    text = "#e6e6e6" if dark else "#1a1a1a"
     return f"""
     * {{ font-family: 'Segoe UI', 'Helvetica'; font-size: 13px; }}
     QFrame#card {{
@@ -105,6 +106,17 @@ def build_stylesheet(dark):
     }}
     QLineEdit:disabled, QComboBox:disabled {{ color: {muted}; }}
     QLineEdit[invalid="true"] {{ border: 1px solid #e53935; }}
+    /* Dropdown popup: keep hovered/selected items readable (was white-on-white). */
+    QComboBox QAbstractItemView {{
+        background: {field_bg};
+        color: {text};
+        border: 1px solid {field_border};
+        outline: none;
+        selection-background-color: #1976D2;
+        selection-color: #ffffff;
+    }}
+    QComboBox QAbstractItemView::item {{ min-height: 22px; padding: 2px 6px; color: {text}; }}
+    QComboBox QAbstractItemView::item:selected {{ background: #1976D2; color: #ffffff; }}
     QPushButton {{
         background: {field_bg};
         border: 1px solid {field_border};
@@ -319,8 +331,17 @@ class LDCMainWindow(QMainWindow):
         self.telemetry_fail_count = 0
         self._emo_thread = None
         self.active_profile_path = ""
-        self.dark = False
         self._unsaved = False
+        # Follow the OS light/dark theme (Qt 6.5+), and track live changes.
+        hints = QApplication.instance().styleHints()
+        try:
+            self.dark = hints.colorScheme() == Qt.ColorScheme.Dark
+        except Exception:
+            self.dark = False
+        try:
+            hints.colorSchemeChanged.connect(self._on_os_theme_changed)
+        except Exception:
+            pass
         self._table_mode = True
         self._reflow_cols = 0
 
@@ -368,15 +389,12 @@ class LDCMainWindow(QMainWindow):
         self.btn_clear.clicked.connect(self.clear_faults)
         top.addWidget(self.btn_clear)
         top.addStretch(1)
-        self.btn_theme = QPushButton("Dark"); self.btn_theme.setCheckable(True); self.btn_theme.setFixedWidth(64)
-        self.btn_theme.clicked.connect(self.toggle_theme)
-        top.addWidget(self.btn_theme)
         self.status_label = QLabel("Status: Disconnected")
         self.status_label.setObjectName("hdr")
         top.addWidget(self.status_label)
         root.addLayout(top)
 
-        # --- Controls bar: title, view toggle, show-unused, master overrides ---
+        # --- Controls bar: title, view toggle, show-unused ---
         bar = QHBoxLayout()
         title = QLabel("Channel Configuration & Live Telemetry"); title.setObjectName("hdr")
         title.setStyleSheet("font-size: 15px;")
@@ -395,22 +413,6 @@ class LDCMainWindow(QMainWindow):
         self.chk_show_unused = QCheckBox("Show unused")
         self.chk_show_unused.stateChanged.connect(self._apply_visibility)
         bar.addWidget(self.chk_show_unused)
-        bar.addSpacing(14)
-
-        self._master_buttons = []
-        for text, fn, kind in [("All ON", lambda: self.set_all_systems("ON"), "green"),
-                               ("All OFF", lambda: self.set_all_systems("OFF"), "red"),
-                               ("TEC On", lambda: self.set_all_dropdowns("TEC", "ON"), ""),
-                               ("TEC Off", lambda: self.set_all_dropdowns("TEC", "OFF"), ""),
-                               ("LAS On", lambda: self.set_all_dropdowns("LAS", "ON"), ""),
-                               ("LAS Off", lambda: self.set_all_dropdowns("LAS", "OFF"), "")]:
-            b = QPushButton(text); b.setEnabled(False); b.clicked.connect(fn)
-            if kind == "green":
-                b.setStyleSheet("background:#2e7d32; color:white; font-weight:600;")
-            elif kind == "red":
-                b.setStyleSheet("background:#c62828; color:white; font-weight:600;")
-            bar.addWidget(b)
-            self._master_buttons.append(b)
         root.addLayout(bar)
 
         # --- Scroll area with the reflowing card container + table header ---
@@ -427,44 +429,79 @@ class LDCMainWindow(QMainWindow):
         self.table_header = self._build_table_header()
         self.cards = [ChannelCard(i, self) for i in range(self.num_channels)]
 
-        # --- Bottom panel: ramp params, profile, run controls ---
-        bottom = QGridLayout()
-        bottom.setHorizontalSpacing(8)
+        # --- Bottom panel: [ params + profile ] [ master overrides ] [ run controls ] ---
+        bottom = QHBoxLayout()
+        bottom.setSpacing(16)
+
+        # Left: ramp parameters + profile management.
+        left = QGridLayout(); left.setHorizontalSpacing(8)
         for r, (lab, attr, default) in enumerate([("T Ramp (°C/s):", "t_ramp", "0.1"),
                                                   ("I Ramp (mA/s):", "i_ramp", "0.5")]):
-            L = QLabel(lab); L.setObjectName("hdr"); bottom.addWidget(L, r, 0)
-            e = QLineEdit(default); e.setFixedWidth(90); e.setValidator(QDoubleValidator())
+            L = QLabel(lab); L.setObjectName("hdr"); left.addWidget(L, r, 0)
+            e = QLineEdit(default); e.setFixedWidth(80); e.setValidator(QDoubleValidator())
             e.textEdited.connect(self._mark_unsaved)
-            setattr(self, attr, e); bottom.addWidget(e, r, 1)
-        Lo = QLabel("T OFF Target (°C):"); Lo.setObjectName("hdr"); bottom.addWidget(Lo, 0, 2)
-        self.t_off = QLineEdit("22.0"); self.t_off.setFixedWidth(90); self.t_off.setValidator(QDoubleValidator())
+            setattr(self, attr, e); left.addWidget(e, r, 1)
+        Lo = QLabel("T OFF Target (°C):"); Lo.setObjectName("hdr"); left.addWidget(Lo, 0, 2)
+        self.t_off = QLineEdit("22.0"); self.t_off.setFixedWidth(80); self.t_off.setValidator(QDoubleValidator())
         self.t_off.textEdited.connect(self._mark_unsaved)
-        bottom.addWidget(self.t_off, 0, 3)
-
-        self.btn_save = QPushButton("💾 Save Profile"); self.btn_save.clicked.connect(self.save_profile)
-        bottom.addWidget(self.btn_save, 2, 0, 1, 2)
-        self.btn_load = QPushButton("📂 Load Profile"); self.btn_load.clicked.connect(self.load_profile)
-        bottom.addWidget(self.btn_load, 2, 2)
-        self.btn_clear_prof = QPushButton("❌ Clear Profile"); self.btn_clear_prof.clicked.connect(self.clear_profile)
-        bottom.addWidget(self.btn_clear_prof, 2, 3)
+        left.addWidget(self.t_off, 0, 3)
+        self.btn_save = QPushButton("💾 Save"); self.btn_save.clicked.connect(self.save_profile)
+        left.addWidget(self.btn_save, 1, 2)
+        self.btn_load = QPushButton("📂 Load"); self.btn_load.clicked.connect(self.load_profile)
+        left.addWidget(self.btn_load, 1, 3)
+        self.btn_clear_prof = QPushButton("❌ Clear"); self.btn_clear_prof.clicked.connect(self.clear_profile)
+        left.addWidget(self.btn_clear_prof, 1, 4)
         self.lbl_profile = QLabel("Active Profile: [Unsaved]"); self.lbl_profile.setObjectName("caption")
-        bottom.addWidget(self.lbl_profile, 2, 4)
-        bottom.setColumnStretch(4, 1)
+        left.addWidget(self.lbl_profile, 2, 0, 1, 5)
+        bottom.addLayout(left)
 
+        # Middle: master overrides — grouped ON/OFF buttons, near the run controls.
+        mid = QVBoxLayout(); mid.setSpacing(4)
+        mlab = QLabel("Master Overrides"); mlab.setObjectName("hdr")
+        mid.addWidget(mlab, alignment=Qt.AlignHCenter)
+        mgrid = QGridLayout(); mgrid.setSpacing(4)
+        self._master_buttons = []
+
+        def mkmaster(text, fn, kind, r, c):
+            b = QPushButton(text); b.setEnabled(False); b.setFixedWidth(84); b.clicked.connect(fn)
+            if kind == "green":
+                b.setStyleSheet("background:#2e7d32; color:white; font-weight:600;")
+            elif kind == "red":
+                b.setStyleSheet("background:#c62828; color:white; font-weight:600;")
+            mgrid.addWidget(b, r, c)
+            self._master_buttons.append(b)
+
+        mkmaster("All ON", lambda: self.set_all_systems("ON"), "green", 0, 0)
+        mkmaster("TEC On", lambda: self.set_all_dropdowns("TEC", "ON"), "", 0, 1)
+        mkmaster("LAS On", lambda: self.set_all_dropdowns("LAS", "ON"), "", 0, 2)
+        mkmaster("All OFF", lambda: self.set_all_systems("OFF"), "red", 1, 0)
+        mkmaster("TEC Off", lambda: self.set_all_dropdowns("TEC", "OFF"), "", 1, 1)
+        mkmaster("LAS Off", lambda: self.set_all_dropdowns("LAS", "OFF"), "", 1, 2)
+        mid.addLayout(mgrid)
+        bottom.addLayout(mid)
+
+        bottom.addStretch(1)
+
+        # Right: emergency + run/stop.
+        self.btn_emo = QPushButton("⚠ EMO OFF"); self.btn_emo.setEnabled(False)
+        self.btn_emo.setFixedWidth(110); self.btn_emo.setMinimumHeight(88)
+        self.btn_emo.setStyleSheet("background:#b71c1c; color:white; font-size:14px; font-weight:bold; border-radius:8px;")
+        self.btn_emo.clicked.connect(self.emergency_las_off)
+        bottom.addWidget(self.btn_emo)
+
+        run_col = QVBoxLayout(); run_col.setSpacing(6)
         self.btn_run_all = QPushButton("▶ RUN ALL"); self.btn_run_all.setEnabled(False)
-        self.btn_run_all.setMinimumHeight(54)
+        self.btn_run_all.setMinimumHeight(52); self.btn_run_all.setMinimumWidth(220)
         self.btn_run_all.setStyleSheet("background:#2e7d32; color:white; font-size:16px; font-weight:bold; border-radius:8px;")
         self.btn_run_all.clicked.connect(self.execute_all)
-        bottom.addWidget(self.btn_run_all, 0, 6, 2, 1)
+        run_col.addWidget(self.btn_run_all)
         self.btn_stop = QPushButton("⏹ CANCEL RUN (Safe)"); self.btn_stop.setEnabled(False)
+        self.btn_stop.setMinimumHeight(30)
         self.btn_stop.setStyleSheet("background:#c62828; color:white; font-weight:bold; border-radius:8px;")
         self.btn_stop.clicked.connect(self.stop_execution)
-        bottom.addWidget(self.btn_stop, 2, 6)
-        self.btn_emo = QPushButton("⚠\nEMO\nOFF"); self.btn_emo.setEnabled(False)
-        self.btn_emo.setFixedWidth(84)
-        self.btn_emo.setStyleSheet("background:#c62828; color:white; font-weight:bold; border-radius:8px;")
-        self.btn_emo.clicked.connect(self.emergency_las_off)
-        bottom.addWidget(self.btn_emo, 0, 5, 3, 1)
+        run_col.addWidget(self.btn_stop)
+        bottom.addLayout(run_col)
+
         root.addLayout(bottom)
 
     def _build_table_header(self):
@@ -1019,9 +1056,8 @@ class LDCMainWindow(QMainWindow):
         for w in (self.t_ramp, self.i_ramp, self.t_off, self.btn_save, self.btn_load, self.btn_clear_prof):
             w.setEnabled(enabled)
 
-    def toggle_theme(self):
-        self.dark = self.btn_theme.isChecked()
-        self.btn_theme.setText("Light" if self.dark else "Dark")
+    def _on_os_theme_changed(self, scheme):
+        self.dark = (scheme == Qt.ColorScheme.Dark)
         self._apply_theme()
 
     def _apply_theme(self):
