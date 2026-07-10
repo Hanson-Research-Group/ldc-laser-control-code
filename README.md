@@ -35,24 +35,27 @@ A graphical desktop control suite for the **Newport LDC-3908 Modular Laser Diode
 
 ```
 ldc-laser-control-code/
-├── docs/                      # Newport hardware manuals & references
-│   ├── LDC-3908-User-Manual.pdf
-│   ├── LDC-3908-User-Manual.txt
-│   ├── LDC-3916370-User-Manual.pdf
-│   └── LDC-3916370-User-Manual.txt
-├── profiles/                  # Saved laser configuration profiles
-│   ├── AirXenonIonizatioCampaign_LaserSetpoints1.txt
-│   ├── AirXenonIonizatioCampaign_LaserSetpoints2.txt
-│   ├── AirXenonIonizatioCampaign_LaserSetpoints3.txt
-│   ├── AirXenonIonizatioCampaign_LaserSetpoints4.txt
-│   └── template_profile.txt
-├── src/                       # Main source code directory
-│   ├── main.py                    # Main Python GUI App entry point
-│   ├── laser_controller_icon.ico  # Application icon (.ico)
-│   └── laser_controller_icon.png  # Application icon (.png)
-├── .gitignore                 # Python-specific git ignore file
-└── README.md                  # Beautiful, highly professional user guide
+├── profiles/                  # Laser configuration profiles (JSON)
+│   └── template_profile.txt       # Example profile to copy and edit
+├── src/                       # Source code
+│   ├── main.py                    # PySide6/Qt GUI entry point
+│   ├── laser_controller.py        # UI-agnostic hardware/protocol core + simulator
+│   ├── sequencer.py               # Safety state machine + ramp engine
+│   ├── theme.py                   # Light/dark theme tokens
+│   ├── test_laser_controller.py   # Head-less core tests
+│   ├── test_sequencer.py          # Head-less sequencer tests
+│   ├── test_gui.py                # Head-less GUI smoke test (offscreen)
+│   ├── laser_controller_icon.ico  # Application icon
+│   └── laser_controller_icon.png
+├── build_script.py            # PyInstaller build script
+├── .gitignore
+├── LICENSE
+└── README.md
 ```
+
+> **Hardware manuals:** the Newport **LDC-3908** and **LDC-3916370** user manuals are
+> not distributed here — download them from [Newport](https://www.newport.com/) for the
+> full SCPI command reference and chassis configuration details.
 
 ---
 
@@ -95,9 +98,9 @@ For each enabled channel, you can configure target parameters:
 2. Input the **Target T (°C)** and **Target I (mA)**.
 3. To run a single channel, click the **▶ Run Ch.** button next to that channel.
 4. To run all enabled channels, pick a **Ramp mode** (each option shows a live time estimate) and click the green **▶ RUN ALL** button:
-   * **Per-channel** — finish each laser's temperature→current sequence before starting the next. *(Default.)*
-   * **By stage** — ramp every channel's temperature first, then every channel's current. Auto-ordered (current-down → temperature → current-up) so the TEC-before-LAS interlock holds for both start-up and shutdown; useful for synchronizing a multi-laser experiment.
-   * **Parallel** — ramp all channels at once (fastest). Every channel still runs the full per-channel safety sequence in its own thread. *Validate on your hardware before relying on it.*
+   * **One laser at a time** — finish each laser's temperature→current sequence before starting the next. *(Default.)*
+   * **All temps, then currents** — ramp every channel's temperature first, then every channel's current. Auto-ordered (current-down → temperature → current-up) so the TEC-before-LAS interlock holds for both start-up and shutdown; useful for synchronizing a multi-laser experiment.
+   * **All lasers at once** — ramp every channel simultaneously (fastest). Each channel still runs the full per-channel safety sequence in its own thread. *Validate on your hardware before relying on it.*
 5. If you need to stop, click the red **⏹ CANCEL RUN (Safe)** button. The software will immediately halt sweeps and hold current values stable at their last safe increments.
 
 ---
@@ -151,4 +154,21 @@ A standalone Windows executable is compiled and distributed using PyInstaller fo
 1. Go to the **Releases** section of this repository.
 2. Download `LDC3908_ModularLaserDiodeControllerSoftware.exe` from the latest release.
 3. Run the executable on any Windows 10/11 PC.
+
+---
+
+## ⚠️ Disclaimer
+
+This software controls real laser hardware. It is provided **"as is", without warranty of
+any kind** (see [LICENSE](LICENSE)). The authors accept no liability for equipment damage or
+injury. You are responsible for the safe operation of your lasers: verify limits, keep the key
+interlock and protective eyewear in place, and **validate the software against your own chassis**
+(especially the parallel/stage ramp modes) before relying on it. Not affiliated with or endorsed
+by Newport Corporation.
+
+---
+
+## 📄 License
+
+Released under the [MIT License](LICENSE). Contributions and use by other labs are welcome.
 
