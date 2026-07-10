@@ -40,6 +40,9 @@ def run():
     res = {}
 
     def start():
+        # Both view modes must build without error.
+        w._set_view_mode(False)   # Cards
+        w._set_view_mode(True)    # Table
         w.com_combo.setCurrentText("Demo Simulator")
         w.connect_serial()
         w.start_scan()
@@ -49,12 +52,12 @@ def run():
         if w.is_scanning:
             QTimer.singleShot(200, wait_scan)
             return
-        res['hidden'] = [w.table.isRowHidden(i) for i in range(8)]
-        r = w.rows[0]
-        r['tec_cmd'].setCurrentText("ON")
-        r['las_cmd'].setCurrentText("ON")
-        r['t_target'].setText("23.0")
-        r['i_target'].setText("6.0")
+        res['shown'] = w._shown()
+        c = w.cards[0]
+        c.tec_cmd.setCurrentText("ON")
+        c.las_cmd.setCurrentText("ON")
+        c.t_target.setText("23.0")
+        c.i_target.setText("6.0")
         w.execute_channels([1])
         QTimer.singleShot(200, wait_run)
 
@@ -66,7 +69,7 @@ def run():
         res['las'] = w.ctl.sim_state['LAS_ON'][0]
         res['T'] = round(w.ctl.sim_state['T_actual'][0], 2)
         res['I'] = round(w.ctl.sim_state['I_actual'][0], 2)
-        res['status'] = w.table.item(0, main_qt.COL_STATUS).text()
+        res['status'] = w.cards[0].status.text()
         app.quit()
 
     QTimer.singleShot(200, start)
@@ -77,14 +80,14 @@ def run():
 
 def main():
     res = run()
-    print("row hidden [ch1..8]:", res.get('hidden'))
+    print("shown channels after scan:", res.get('shown'))
     print("ch1 sim: TEC", res.get('tec'), "LAS", res.get('las'),
           "T", res.get('T'), "I", res.get('I'))
     print("ch1 status:", res.get('status'))
 
     checks = [
-        ("scan auto-hid empty/no-laser channels",
-         res.get('hidden') == [False, False, True, True, False, True, True, True]),
+        ("scan auto-hid empty/no-laser channels (shown = populated)",
+         res.get('shown') == [0, 1, 4]),
         ("TEC + LAS enabled on ch1", res.get('tec') == 1 and res.get('las') == 1),
         ("ramped to target T/I", abs(res.get('T', 0) - 23.0) < 0.1 and abs(res.get('I', 0) - 6.0) < 0.1),
         ("final status set", str(res.get('status', "")).startswith("Final Set:")),
