@@ -133,12 +133,7 @@ The hardware/protocol and safety-critical control logic live in a UI-agnostic co
 
 This core is exercised by head-less unit tests (`test_laser_controller.py`, `test_sequencer.py`) that run with no display.
 
-Two front-ends sit on top of the same core:
-
-*   **`main.py`** — the current `CustomTkinter` GUI (light/dark toggle, responsive Table/Cards channel views, auto-hide of unused channels).
-*   **`main_qt.py`** — a **PySide6 / Qt** front-end (migration in progress). Requires `pip install PySide6`. Worker-thread updates reach the GUI through Qt signals. Run with `python src/main_qt.py`; smoke-tested head-less by `test_qt.py`.
-
-Both keep telemetry queries and sequence ramps on background worker threads, preventing UI lockups and connection timing jitters.
+The GUI (`main.py`) is built with **PySide6 / Qt** (`pip install PySide6`): a responsive Table/Cards channel view with auto-hide of unused channels, OS-following light/dark theme, and profile management. Worker-thread updates reach the GUI through Qt signals, so telemetry queries and sequence ramps run on background threads without locking the UI. It is smoke-tested head-less by `test_gui.py`.
 
 ---
 
@@ -147,7 +142,7 @@ Both keep telemetry queries and sequence ramps on background worker threads, pre
 A standalone Windows executable is compiled and distributed using PyInstaller for systems without Python installed, or for convenient deployment.
 
 ### Key Features:
-*   **Modern Interface**: Premium dark-mode GUI using CustomTkinter.
+*   **Modern Interface**: PySide6 / Qt GUI that follows the OS light/dark theme.
 *   **High-DPI Scaling**: Fits and resizes dynamically across diverse monitor sizes and screen resolutions.
 *   **Zero Dependencies**: Run the `.exe` directly; no runtime or compiler libraries required.
 

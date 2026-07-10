@@ -1,23 +1,17 @@
 import os
 import sys
-import shutil
-import subprocess
-import customtkinter
 
 def build_exe():
     print("Starting build process...")
-    
-    # Path of customtkinter
-    ctk_path = os.path.dirname(customtkinter.__file__)
-    print(f"customtkinter path: {ctk_path}")
 
-    # Build options
+    # Build options. The GUI is PySide6/Qt; PyInstaller's bundled PySide6 hook
+    # collects the required Qt plugins automatically, so no --add-data is needed
+    # for the framework itself — only our icon resources.
     params = [
         'src/main.py',
         '--onefile',
         '--noconsole',
         '--name=LDC3908_ModularLaserDiodeControllerSoftware',
-        f'--add-data={ctk_path}{os.pathsep}customtkinter/',
         f'--add-data=src/laser_controller_icon.png{os.pathsep}src/',
         f'--add-data=src/laser_controller_icon.ico{os.pathsep}src/',
         '--icon=src/laser_controller_icon.ico'

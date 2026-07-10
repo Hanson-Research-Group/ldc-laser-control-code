@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Headless (offscreen) smoke test for the PySide6/Qt front-end (main_qt.py).
+Headless (offscreen) smoke test for the PySide6/Qt GUI (main.py).
 
 Runs the real Qt event loop against the Demo Simulator: connect -> scan ->
 configure a channel -> run a sequence, and checks the simulator state + the
 auto-hide visibility filter. Skips cleanly if PySide6 is not installed.
 
-Run:  python src/test_qt.py
+Run:  python src/test_gui.py
 """
 
 import os
@@ -34,8 +34,8 @@ def run():
     QMessageBox.warning = staticmethod(lambda *a, **k: None)
     QMessageBox.critical = staticmethod(lambda *a, **k: None)
 
-    import main_qt
-    w = main_qt.LDCMainWindow()
+    import main
+    w = main.LDCMainWindow()
     w.show()
     res = {}
 

@@ -1,1688 +1,1271 @@
 #!/usr/bin/env python3
 """
-Newport LDC-3908 Modular Laser Diode Controller Software
-A production-grade graphical desktop control suite ported from MATLAB.
-Developed by Zev Granowitz in collaboration with .
+Newport LDC-3908 Laser Diode Controller — PySide6 / Qt front-end.
+
+Qt GUI on top of the UI-agnostic control core:
+  * laser_controller.LaserController — serial I/O, simulator, safety helpers
+  * sequencer.Sequencer              — safety state machine + ramps
+
+A QtBridge turns the engine's SequenceEvents callbacks (fired on worker threads)
+into Qt signals delivered to the GUI thread via queued connections.
+
+Run:  python src/main.py
 """
 
-import sys
-import os
 import json
 import math
-import time
+import os
+import sys
 import threading
-import serial
+import time
+
+from PySide6.QtCore import Qt, QObject, Signal, QTimer
+from PySide6.QtGui import QColor, QPalette, QPainter, QBrush, QIcon, QDoubleValidator
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QComboBox, QLineEdit,
+    QCheckBox, QFrame, QHBoxLayout, QVBoxLayout, QGridLayout, QMessageBox,
+    QFileDialog, QScrollArea, QButtonGroup,
+)
+
 import serial.tools.list_ports
-import customtkinter as ctk
-import tkinter as tk
-from tkinter import filedialog, messagebox
 
 from laser_controller import LaserController
 from sequencer import Sequencer, SequenceEvents, ChannelPlan
 import theme
 
-import ctypes
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(1)
-except Exception:
-    pass
+PREF_FILE = os.path.join(os.path.expanduser("~"), ".ldc_laser_control_prefs.json")
+CARD_W = 300  # logical px; approx one compact card width incl. margins
 
-# Set appearance mode and color theme
-ctk.set_appearance_mode("Light")
-ctk.set_default_color_theme("blue")
 
-def resolve_path(relative_path):
-    """Get absolute path to resource, works for dev and for PyInstaller."""
+def resolve_path(rel):
     try:
-        base_path = sys._MEIPASS
+        base = sys._MEIPASS
     except AttributeError:
-        # main.py is in src/, so parent directory of os.path.dirname(__file__) is root
-        base_path = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
-    return os.path.join(base_path, relative_path)
-
-class LEDIndicator(tk.Canvas):
-    """A custom Tkinter widget to draw a beautiful, smooth status LED.
-
-    The LED lives on a bare tk.Canvas, which CustomTkinter does not theme, so its
-    background is resolved from the parent frame (or the theme's frame color when
-    the parent is transparent) for the active appearance mode — and can be
-    refreshed on a light/dark toggle via refresh_theme()."""
-    def __init__(self, parent, size=18, color="#cccccc", **kwargs):
-        super().__init__(parent, width=size, height=size,
-                         bg=self._resolve_bg(parent), highlightthickness=0, **kwargs)
-        self.size = size
-        self.color = color
-        self.draw_circle()
-
-    @staticmethod
-    def _resolve_bg(parent):
-        mode_idx = 0 if ctk.get_appearance_mode().lower() == "light" else 1
-        try:
-            parent_fg = parent.cget("fg_color")
-            if isinstance(parent_fg, (list, tuple)):
-                return parent_fg[mode_idx]
-            if parent_fg and parent_fg != "transparent":
-                return parent_fg
-        except Exception:
-            pass
-        # Transparent/unknown parent: fall back to the theme's frame color.
-        return theme.frame_bg()
-
-    def draw_circle(self):
-        self.delete("all")
-        self.create_oval(2, 2, self.size - 2, self.size - 2,
-                         fill=self.color, outline=self.color, width=1.0)
-
-    def set_color(self, color):
-        self.color = color
-        self.draw_circle()
-
-    def refresh_theme(self):
-        """Re-resolve the canvas background for the current appearance mode."""
-        try:
-            self.configure(bg=self._resolve_bg(self.master))
-            self.draw_circle()
-        except Exception:
-            pass
+        base = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+    return os.path.join(base, rel)
 
 
-class _TkSequenceEvents(SequenceEvents):
-    """Bridges the UI-agnostic Sequencer to the Tk GUI. The sequencer runs on a
-    worker thread, so every callback is marshalled onto the Tk main thread via
-    app.after(...) — the same pattern the ramp code used inline before extraction."""
+# ----------------------------------------------------------------------------
+# Theme (Qt): map semantic status kinds to QColors, build a stylesheet + palette.
+# ----------------------------------------------------------------------------
+def status_hex(kind, dark):
+    light_hex, dark_hex = theme.status(kind)
+    return dark_hex if dark else light_hex
 
-    def __init__(self, app):
-        self.app = app
+
+def make_palette(dark):
+    pal = QPalette()
+    if dark:
+        window, base, text, alt = "#1f2124", "#2a2d31", "#e6e6e6", "#33373c"
+    else:
+        window, base, text, alt = "#f2f3f5", "#ffffff", "#1a1a1a", "#e9ebee"
+    pal.setColor(QPalette.Window, QColor(window))
+    pal.setColor(QPalette.Base, QColor(base))
+    pal.setColor(QPalette.AlternateBase, QColor(alt))
+    pal.setColor(QPalette.Text, QColor(text))
+    pal.setColor(QPalette.WindowText, QColor(text))
+    pal.setColor(QPalette.Button, QColor(alt))
+    pal.setColor(QPalette.ButtonText, QColor(text))
+    pal.setColor(QPalette.Highlight, QColor("#1976D2"))
+    pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+    pal.setColor(QPalette.PlaceholderText, QColor("#888888"))
+    return pal
+
+
+def build_stylesheet(dark):
+    card_bg = "#2a2d31" if dark else "#ffffff"
+    card_border = "#3c4046" if dark else "#d6d9dd"
+    field_bg = "#33373c" if dark else "#ffffff"
+    field_border = "#464b52" if dark else "#c4c8cd"
+    header_bg = "#26292d" if dark else "#eef0f2"
+    muted = "#9aa0a6" if dark else "#6b7075"
+    text = "#e6e6e6" if dark else "#1a1a1a"
+    return f"""
+    * {{ font-family: 'Segoe UI', 'Helvetica'; font-size: 13px; }}
+    QFrame#card {{
+        background: {card_bg};
+        border: 1px solid {card_border};
+        border-radius: 10px;
+    }}
+    QFrame#tableHeader {{
+        background: {header_bg};
+        border: 1px solid {card_border};
+        border-radius: 8px;
+    }}
+    QLabel#chNum {{ font-size: 15px; font-weight: 600; }}
+    QLabel#caption {{ color: {muted}; font-size: 11px; }}
+    QLabel#hdr {{ font-weight: 600; }}
+    QLabel#reading {{ font-size: 16px; }}
+    QLineEdit, QComboBox {{
+        background: {field_bg};
+        color: {text};
+        border: 1px solid {field_border};
+        border-radius: 6px;
+        padding: 3px 6px;
+        min-height: 20px;
+    }}
+    QLineEdit:hover, QComboBox:hover {{ border-color: #1976D2; }}
+    QLineEdit:focus, QComboBox:focus {{ border-color: #1976D2; }}
+    QLineEdit:disabled, QComboBox:disabled {{ color: {muted}; }}
+    QLineEdit[invalid="true"] {{ border: 1px solid #e53935; }}
+    /* Dropdown popup: keep hovered/selected items readable (was white-on-white). */
+    QComboBox QAbstractItemView {{
+        background: {field_bg};
+        color: {text};
+        border: 1px solid {field_border};
+        outline: none;
+        selection-background-color: #1976D2;
+        selection-color: #ffffff;
+    }}
+    QComboBox QAbstractItemView::item {{ min-height: 22px; padding: 2px 6px; color: {text}; }}
+    QComboBox QAbstractItemView::item:hover {{ background: #1976D2; color: #ffffff; }}
+    QComboBox QAbstractItemView::item:selected {{ background: #1976D2; color: #ffffff; }}
+    QPushButton {{
+        background: {field_bg};
+        border: 1px solid {field_border};
+        border-radius: 7px;
+        padding: 6px 12px;
+    }}
+    QPushButton:hover:enabled {{ border-color: #1976D2; }}
+    QPushButton:disabled {{ color: {muted}; }}
+    QPushButton#seg {{ border-radius: 0px; padding: 5px 14px; }}
+    QPushButton#seg:checked {{ background: #1976D2; color: white; border-color: #1976D2; }}
+    QScrollArea {{ border: none; }}
+    QCheckBox::indicator {{ width: 16px; height: 16px; }}
+    """
+
+
+# ----------------------------------------------------------------------------
+# LED indicator: a small painted dot (CTk had a canvas version).
+# ----------------------------------------------------------------------------
+class LedDot(QWidget):
+    def __init__(self, size=16, parent=None):
+        super().__init__(parent)
+        self._size = size
+        self._color = QColor(theme.led("idle"))
+        self.setFixedSize(size, size)
+
+    def set_kind(self, kind):
+        self._color = QColor(theme.led(kind))
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(QBrush(self._color))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(1, 1, self._size - 2, self._size - 2)
+
+
+# ----------------------------------------------------------------------------
+# Bridge: SequenceEvents (worker thread) -> Qt signals (GUI thread).
+# ----------------------------------------------------------------------------
+class QtBridge(QObject):
+    status = Signal(int, str, str)
+    led = Signal(int, str)
+    liveOutput = Signal(int, str, str)
+    liveValue = Signal(int, str, float)
+    tick = Signal()
+    halted = Signal(int)
+    fault = Signal(int, str)
+    post = Signal(object)
+
+
+class QtSequenceEvents(SequenceEvents):
+    def __init__(self, bridge):
+        self.b = bridge
 
     def on_status(self, idx, text, kind):
-        # Map the engine's semantic status kind to a themed (light, dark) color.
-        self.app.after(0, self.app.update_channel_status, idx, text, theme.status(kind))
+        self.b.status.emit(idx, text, kind)
 
     def on_led(self, idx, kind):
-        self.app.after(0, self.app.ch_ui[idx]["led"].set_color, theme.led(kind))
+        self.b.led.emit(idx, kind)
 
     def on_live_output(self, idx, kind, state):
-        self.app.after(0, self.app.update_live_out_ui, idx, kind, state)
+        self.b.liveOutput.emit(idx, kind, state)
 
     def on_live_value(self, idx, kind, value):
-        widget = self.app.ch_ui[idx]["cur_t" if kind == "T" else "cur_i"]
-        self.app.after(0, set_entry_val, widget, f"{value:.1f}")
+        self.b.liveValue.emit(idx, kind, float(value))
 
     def on_tick(self):
-        # update_eta() itself schedules the label update via after(), so it is
-        # safe to call directly from the worker thread.
-        self.app.update_eta()
+        self.b.tick.emit()
 
     def on_channel_halted(self, idx):
-        self.app.after(0, self.app._handle_channel_halted, idx)
+        self.b.halted.emit(idx)
 
     def on_channel_fault(self, idx, message):
-        self.app.after(0, self.app._handle_channel_fault, idx, message)
+        self.b.fault.emit(idx, message)
 
 
-class LDCControllerApp(ctk.CTk):
+# Table-mode column spec: (title, fixed width, header alignment). Column 4
+# (Status) stretches; all other columns are pinned to these widths in BOTH the
+# header and every row so the labels line up with the data, and the header text
+# is aligned to match each column's content.
+_AL = Qt.AlignLeft | Qt.AlignVCenter
+_AC = Qt.AlignCenter
+_AR = Qt.AlignRight | Qt.AlignVCenter
+TABLE_COLS = [
+    ("Ch", 46, _AL), ("On", 34, _AC), ("Label", 124, _AL), ("", 22, _AC), ("Status", 150, _AL),
+    ("Live TEC", 64, _AC), ("Live LAS", 64, _AC), ("Live T", 62, _AR), ("Live I", 62, _AR),
+    ("Tgt TEC", 74, _AL), ("Tgt LAS", 74, _AL), ("Tgt T", 62, _AL), ("Max T", 46, _AC),
+    ("Tgt I", 62, _AL), ("Max I", 46, _AC), ("Run", 98, _AC),
+]
+STATUS_COL = 4
+
+
+class ChannelCard(QFrame):
+    """One channel's controls. The SAME widgets are re-laid out for Table view
+    (a full-width horizontal row) and Cards view (a compact vertical block)."""
+
+    def __init__(self, idx, win):
+        super().__init__()
+        self.idx = idx
+        self.win = win
+        self.setObjectName("card")
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(10, 8, 10, 8)
+        self._grid.setHorizontalSpacing(6)
+        self._grid.setVerticalSpacing(4)
+
+        # NOTE: every widget is parented to `self` (the card) at creation. If a
+        # child were left parentless, _clear()'s setVisible(True) would turn it
+        # into a floating top-level window (the "tiny windows flashing" bug, seen
+        # as QWindowsWindow::setGeometry warnings on *Window objects).
+        ch = idx + 1
+        self.num = QLabel(f"Ch {ch}", self); self.num.setObjectName("chNum")
+        self.led = LedDot(parent=self)
+        self.enable = QCheckBox(self); self.enable.setEnabled(False)
+        self.enable.stateChanged.connect(win._on_enable_changed)
+        self.label = QLineEdit(f"Laser {ch}", self); self.label.setEnabled(False)
+        self.label.textEdited.connect(win._mark_unsaved)
+        self.status = QLabel("Run Scan First", self); self.status.setObjectName("status")
+        self.live_tec = QLabel("OFF", self); self.live_tec.setAlignment(Qt.AlignCenter)
+        self.live_las = QLabel("OFF", self); self.live_las.setAlignment(Qt.AlignCenter)
+        self.live_t = QLabel("0.0", self); self.live_t.setObjectName("reading"); self.live_t.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.live_i = QLabel("0.0", self); self.live_i.setObjectName("reading"); self.live_i.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.tec_cmd = QComboBox(self); self.tec_cmd.addItems(["ON", "OFF"]); self.tec_cmd.setCurrentText("OFF"); self.tec_cmd.setEnabled(False)
+        self.tec_cmd.currentTextChanged.connect(win._mark_unsaved)
+        self.las_cmd = QComboBox(self); self.las_cmd.addItems(["ON", "OFF"]); self.las_cmd.setCurrentText("OFF"); self.las_cmd.setEnabled(False)
+        self.las_cmd.currentTextChanged.connect(win._mark_unsaved)
+        self.t_target = QLineEdit("22.0", self); self.t_target.setEnabled(False); self.t_target.setValidator(QDoubleValidator())
+        self.t_target.textEdited.connect(win._mark_unsaved)
+        self.i_target = QLineEdit("0.0", self); self.i_target.setEnabled(False); self.i_target.setValidator(QDoubleValidator())
+        self.i_target.textEdited.connect(win._mark_unsaved)
+        self.max_t = QLabel("-", self); self.max_t.setObjectName("caption"); self.max_t.setAlignment(Qt.AlignCenter)
+        self.max_i = QLabel("-", self); self.max_i.setObjectName("caption"); self.max_i.setAlignment(Qt.AlignCenter)
+        self.run = QPushButton("▶ Run Ch.", self); self.run.setEnabled(False)
+        self.run.clicked.connect(lambda: win.execute_channels([ch]))
+
+        # Captions shown only in Cards view (Table view has a shared header).
+        self._caps = [QLabel(t, self) for t in
+                      ("Live TEC", "Live LAS", "Live T °C", "Live I mA", "TEC", "LAS", "Target T", "Target I", "Max limit")]
+        for c in self._caps:
+            c.setObjectName("caption")
+            c.setAlignment(Qt.AlignCenter)
+
+        self._all = [self.num, self.led, self.enable, self.label, self.status,
+                     self.live_tec, self.live_las, self.live_t, self.live_i,
+                     self.tec_cmd, self.las_cmd, self.t_target, self.i_target,
+                     self.max_t, self.max_i, self.run] + self._caps
+
+    def _clear(self):
+        for w in self._all:
+            self._grid.removeWidget(w)
+            w.setVisible(True)
+        for c in range(max(16, self._grid.columnCount())):
+            self._grid.setColumnStretch(c, 0)
+            self._grid.setColumnMinimumWidth(c, 0)
+
+    def set_table_mode(self):
+        self._clear()
+        self._grid.setHorizontalSpacing(10)
+        for c in self._caps:
+            c.setVisible(False)
+        g = self._grid
+        # widget per column, in TABLE_COLS order
+        order = [self.num, self.enable, self.label, self.led, self.status,
+                 self.live_tec, self.live_las, self.live_t, self.live_i,
+                 self.tec_cmd, self.las_cmd, self.t_target, self.max_t,
+                 self.i_target, self.max_i, self.run]
+        small = {self.enable, self.led}
+        for c, (w, (_, width, _align)) in enumerate(zip(order, TABLE_COLS)):
+            self._grid.setColumnMinimumWidth(c, width)
+            if c == STATUS_COL or w in small:
+                w.setMinimumWidth(0); w.setMaximumWidth(16777215)
+            else:
+                w.setFixedWidth(width)
+            if w in small:
+                g.addWidget(w, 0, c, alignment=Qt.AlignCenter)
+            else:
+                g.addWidget(w, 0, c)
+        self._grid.setColumnStretch(STATUS_COL, 1)
+
+    def set_card_mode(self):
+        self._clear()
+        self._grid.setHorizontalSpacing(6)
+        # Restore natural sizing (table mode pins widths).
+        for w in (self.num, self.label, self.live_tec, self.live_las, self.live_t,
+                  self.live_i, self.tec_cmd, self.las_cmd, self.t_target,
+                  self.i_target, self.max_t, self.max_i, self.run):
+            w.setMinimumWidth(0); w.setMaximumWidth(16777215)
+        for c in self._caps:
+            c.setVisible(True)
+        for c in range(4):
+            self._grid.setColumnStretch(c, 1)
+        g = self._grid
+        (cap_ltec, cap_llas, cap_lt, cap_li, cap_tec, cap_las, cap_tt, cap_ti, cap_max) = self._caps
+        g.addWidget(self.num, 0, 0)
+        g.addWidget(self.label, 0, 1, 1, 2)
+        g.addWidget(self.enable, 0, 3, alignment=Qt.AlignRight)
+        g.addWidget(self.led, 1, 0, alignment=Qt.AlignCenter)
+        g.addWidget(self.status, 1, 1, 1, 3)
+        g.addWidget(cap_ltec, 2, 0); g.addWidget(cap_llas, 2, 1); g.addWidget(cap_lt, 2, 2); g.addWidget(cap_li, 2, 3)
+        g.addWidget(self.live_tec, 3, 0); g.addWidget(self.live_las, 3, 1)
+        g.addWidget(self.live_t, 3, 2); g.addWidget(self.live_i, 3, 3)
+        g.addWidget(cap_tec, 4, 0); g.addWidget(cap_las, 4, 1); g.addWidget(cap_tt, 4, 2); g.addWidget(cap_ti, 4, 3)
+        g.addWidget(self.tec_cmd, 5, 0); g.addWidget(self.las_cmd, 5, 1)
+        g.addWidget(self.t_target, 5, 2); g.addWidget(self.i_target, 5, 3)
+        g.addWidget(cap_max, 6, 1, alignment=Qt.AlignRight)
+        g.addWidget(self.max_t, 6, 2); g.addWidget(self.max_i, 6, 3)
+        g.addWidget(self.run, 7, 0, 1, 4)
+
+
+class LDCMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-
-        # --- Configure Main Window ---
-        self.title("LDC-3908 Modular Laser Diode Controller Software v0.3.1")
-        self.geometry("1850x950")
-        # Low minimum so the app is usable on laptops and at half/quarter of a
-        # large display; the channel cards reflow to fewer columns as it shrinks.
-        self.minsize(900, 650)
-        
-        # Set window icon
-        try:
-            icon_ico = resolve_path("src/laser_controller_icon.ico")
-            icon_png = resolve_path("src/laser_controller_icon.png")
-            if os.path.exists(icon_ico):
-                self.iconbitmap(icon_ico)
-            elif os.path.exists(icon_png):
-                self.iconphoto(False, tk.PhotoImage(file=icon_png))
-        except:
-            pass
-
         self.num_channels = 8
-
-        # --- Control Core ---
-        # All hardware I/O, the Demo Simulator, and the shared control flags live
-        # in the UI-agnostic LaserController (laser_controller.py). The GUI accesses
-        # them through the proxy properties / delegator methods defined below.
         self.ctl = LaserController(num_channels=self.num_channels)
+        self.bridge = QtBridge()
+        self.seq = Sequencer(self.ctl, events=QtSequenceEvents(self.bridge))
 
-        # Ramp / sequence engine (also UI-agnostic). It drives self.ctl and reports
-        # back through the Tk event adapter, which marshals every update onto the
-        # main thread — replacing the old direct self.after(...) calls scattered
-        # through the ramp code.
-        self.seq = Sequencer(self.ctl, events=_TkSequenceEvents(self))
-
-        # --- Application (UI) State Variables ---
         self.is_executing = False
         self.is_scanning = False
-        self.active_profile_path = ""
+        self.is_closing = False
+        self.has_scanned = False
+        self.populated = [False] * self.num_channels
         self.total_estimated_time = 0.0
         self.sequence_start_time = None
-        self.is_closing = False
-
-        # Telemetry control
-        self.telemetry_thread = None
         self.telemetry_active = False
+        self.telemetry_thread = None
         self.telemetry_fail_count = 0
-
-        # --- Build GUI Layout ---
-        self.setup_layout()
-
-        # --- Load Last Profile Preference ---
-        self.load_last_profile_preference()
-
-        # --- Handle Application Closing Gracefully ---
-        self.protocol("WM_DELETE_WINDOW", self.close_app)
-
-    # ----------------------------------------------------
-    # CONTROL-CORE PROXIES
-    # ----------------------------------------------------
-    # Compatibility shims so the GUI can keep referring to self.ser /
-    # self.is_stop_requested / self.send_cmd(...) etc. while the hardware state and
-    # protocol I/O actually live in the extracted LaserController (self.ctl). As
-    # the scan / telemetry / ramp / sequence logic migrates into the core in later
-    # Phase-0 sub-steps, these proxies and delegators will be removed.
-    @property
-    def ser(self):
-        return self.ctl.ser
-
-    @ser.setter
-    def ser(self, value):
-        self.ctl.ser = value
-
-    @property
-    def serial_lock(self):
-        return self.ctl.serial_lock
-
-    @property
-    def is_simulated(self):
-        return self.ctl.is_simulated
-
-    @is_simulated.setter
-    def is_simulated(self, value):
-        self.ctl.is_simulated = value
-
-    @property
-    def is_stop_requested(self):
-        return self.ctl.is_stop_requested
-
-    @is_stop_requested.setter
-    def is_stop_requested(self, value):
-        self.ctl.is_stop_requested = value
-
-    @property
-    def is_emo_requested(self):
-        return self.ctl.is_emo_requested
-
-    @is_emo_requested.setter
-    def is_emo_requested(self, value):
-        self.ctl.is_emo_requested = value
-
-    def send_cmd(self, cmd):
-        self.ctl.send_cmd(cmd)
-
-    def read_cmd(self):
-        return self.ctl.read_cmd()
-
-    def query_cmd(self, cmd):
-        return self.ctl.query_cmd(cmd)
-
-    def cmd_pause(self, cmd):
-        self.ctl.cmd_pause(cmd)
-
-    def safe_pause(self, t):
-        self.ctl.safe_pause(t)
-
-    def verify_hw_state(self, cmd, expected_val, err_msg):
-        self.ctl.verify_hw_state(cmd, expected_val, err_msg)
-
-    def check_controller_errors_threadsafe(self, ch_num):
-        return self.ctl.check_controller_errors(ch_num)
-
-    def setup_layout(self):
-        # Configure root grid weights for responsiveness
-        self.grid_rowconfigure(0, weight=0)  # Top panel
-        self.grid_rowconfigure(1, weight=1)  # Channels panel
-        self.grid_rowconfigure(2, weight=0)  # Bottom panel
-        self.grid_columnconfigure(0, weight=1)
-
-        # ----------------------------------------------------
-        # 1. TOP PANEL: CONNECTION
-        # ----------------------------------------------------
-        top_frame = ctk.CTkFrame(self, height=60)
-        top_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=5)
-        top_frame.grid_columnconfigure(5, weight=1)  # Spacer column
-
-        ctk.CTkLabel(top_frame, text="COM Port:", font=("Segoe UI", 15, "bold")).grid(row=0, column=0, padx=(10, 5), pady=10, sticky="w")
-
-        # Scan system COM ports
-        self.avail_ports = [port.device for port in serial.tools.list_ports.comports()]
-        self.avail_ports.append("Demo Simulator")
-        
-        self.com_dropdown = ctk.CTkOptionMenu(top_frame, values=self.avail_ports, width=203)
-        self.com_dropdown.grid(row=0, column=1, padx=(5, 0), pady=10)
-        
-        self.btn_refresh = ctk.CTkButton(top_frame, text="↻", width=41, command=self.refresh_ports)
-        self.btn_refresh.grid(row=0, column=2, padx=(2, 5), pady=10)
-
-        # P1 #5: Prefer real hardware port first (matches MATLAB behaviour);
-        # only fall back to Demo Simulator when no physical ports exist.
-        real_ports = [p for p in self.avail_ports if p != "Demo Simulator"]
-        if real_ports:
-            self.com_dropdown.set(real_ports[0])
-        else:
-            self.com_dropdown.set("Demo Simulator")
-
-        self.btn_connect = ctk.CTkButton(top_frame, text="Connect", width=135, command=self.connect_serial)
-        self.btn_connect.grid(row=0, column=3, padx=5, pady=10)
-
-        self.btn_scan = ctk.CTkButton(top_frame, text="Scan Channels", width=162, state="disabled", command=self.start_channel_scan)
-        self.btn_scan.grid(row=0, column=4, padx=5, pady=10)
-
-        self.btn_clear_faults = ctk.CTkButton(top_frame, text="Clear Faults", width=135, fg_color="transparent", text_color=theme.status("fault"),
-                                               hover_color="#ffebee", state="disabled", command=self.clear_faults)
-        self.btn_clear_faults.grid(row=0, column=5, padx=5, pady=10)
-
-        # Appearance (light/dark) toggle — user-selectable at runtime.
-        self.appearance_toggle = ctk.CTkSegmentedButton(
-            top_frame, values=["Light", "Dark"], width=140, command=self.set_appearance)
-        self.appearance_toggle.set(ctk.get_appearance_mode())
-        self.appearance_toggle.grid(row=0, column=6, padx=(10, 5), pady=10, sticky="e")
-
-        self.status_label = ctk.CTkLabel(top_frame, text="Status: Disconnected", text_color=theme.status("fault"), font=("Segoe UI", 16, "bold"))
-        self.status_label.grid(row=0, column=7, padx=(10, 20), pady=10, sticky="e")
-
-        # ----------------------------------------------------
-        # 2. MIDDLE PANEL: CHANNEL CARDS (responsive, reflowing)
-        # ----------------------------------------------------
-        chan_panel = ctk.CTkFrame(self)
-        chan_panel.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
-        chan_panel.grid_rowconfigure(1, weight=1)
-        chan_panel.grid_columnconfigure(0, weight=1)
-
-        # --- Controls bar: title, show-unused switch, master overrides ---
-        bar = ctk.CTkFrame(chan_panel, fg_color="transparent")
-        bar.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 2))
-        bar.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(bar, text="Channel Configuration & Live Telemetry",
-                     font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w")
-
-        right = ctk.CTkFrame(bar, fg_color="transparent")
-        right.grid(row=0, column=2, sticky="e")
-
-        self.view_toggle = ctk.CTkSegmentedButton(right, values=["Table", "Cards"],
-                                                  width=140, command=self._set_view_mode)
-        self.view_toggle.set("Table")
-        self.view_toggle.pack(side="left", padx=(0, 14))
-
-        self.show_unused_var = tk.BooleanVar(value=False)
-        self.chk_show_unused = ctk.CTkSwitch(right, text="Show unused", variable=self.show_unused_var,
-                                             command=lambda: self._reflow_cards(force=True))
-        self.chk_show_unused.pack(side="left", padx=(0, 14))
-
-        self.btn_master_on = ctk.CTkButton(right, text="All ON", width=78, font=("Segoe UI", 13, "bold"),
-                                           fg_color=theme.GREEN, hover_color=theme.GREEN_HOVER, text_color="white",
-                                           state="disabled", command=lambda: self.set_all_systems("ON"))
-        self.btn_master_on.pack(side="left", padx=3)
-        self.btn_master_off = ctk.CTkButton(right, text="All OFF", width=78, font=("Segoe UI", 13, "bold"),
-                                            fg_color=theme.RED, hover_color=theme.RED_HOVER, text_color="white",
-                                            state="disabled", command=lambda: self.set_all_systems("OFF"))
-        self.btn_master_off.pack(side="left", padx=3)
-        self.btn_tec_on = ctk.CTkButton(right, text="TEC On", width=72, font=("Segoe UI", 13),
-                                        state="disabled", command=lambda: self.set_all_dropdowns("TEC", "ON"))
-        self.btn_tec_on.pack(side="left", padx=3)
-        self.btn_tec_off = ctk.CTkButton(right, text="TEC Off", width=72, font=("Segoe UI", 13),
-                                         state="disabled", command=lambda: self.set_all_dropdowns("TEC", "OFF"))
-        self.btn_tec_off.pack(side="left", padx=3)
-        self.btn_las_on = ctk.CTkButton(right, text="LAS On", width=72, font=("Segoe UI", 13),
-                                        state="disabled", command=lambda: self.set_all_dropdowns("LAS", "ON"))
-        self.btn_las_on.pack(side="left", padx=3)
-        self.btn_las_off = ctk.CTkButton(right, text="LAS Off", width=72, font=("Segoe UI", 13),
-                                         state="disabled", command=lambda: self.set_all_dropdowns("LAS", "OFF"))
-        self.btn_las_off.pack(side="left", padx=3)
-
-        # --- Scrollable, reflowing card container ---
-        self.cards_container = ctk.CTkScrollableFrame(chan_panel, fg_color="transparent")
-        self.cards_container.grid(row=1, column=0, sticky="nsew", padx=6, pady=4)
-
-        # Per-channel state used by the visibility filter.
-        self._has_scanned = False
-        self.ch_populated = [False] * self.num_channels
-        self._reflow_key = None
-
-        self.ch_ui = []
-        for i in range(self.num_channels):
-            self.ch_ui.append(self._build_channel_card(i))
-
-        # Default to Table view (full-width stacked rows under a shared header).
-        self._build_table_header()
+        self._emo_thread = None
+        self.active_profile_path = ""
+        self._unsaved = False
+        # Follow the OS light/dark theme (Qt 6.5+), and track live changes.
+        hints = QApplication.instance().styleHints()
+        try:
+            self.dark = hints.colorScheme() == Qt.ColorScheme.Dark
+        except Exception:
+            self.dark = False
+        try:
+            hints.colorSchemeChanged.connect(self._on_os_theme_changed)
+        except Exception:
+            pass
         self._table_mode = True
-        for ch in self.ch_ui:
-            self._layout_table_row(ch)
+        self._reflow_cols = 0
 
-        # Reflow on window resize; prime once geometry settles.
-        self.bind("<Configure>", self._reflow_cards)
-        self.after(60, lambda: self._reflow_cards(force=True))
+        self.setWindowTitle("LDC-3908 Modular Laser Diode Controller Software v0.5.0")
+        self.resize(1500, 860)
+        self.setMinimumSize(900, 620)
+        for ext in ("src/laser_controller_icon.ico", "src/laser_controller_icon.png"):
+            p = resolve_path(ext)
+            if os.path.exists(p):
+                self.setWindowIcon(QIcon(p))
+                break
 
-        # ----------------------------------------------------
-        # 3. BOTTOM PANEL: PARAMETERS & UTILITIES
-        # ----------------------------------------------------
-        bot_panel = ctk.CTkFrame(self, height=150)
-        bot_panel.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
-        
-        # Configure layout grids inside bottom panel
-        bot_panel.grid_columnconfigure(4, weight=1)  # Spacer column
-        bot_panel.grid_rowconfigure(0, weight=1)
-        bot_panel.grid_rowconfigure(1, weight=1)
-        bot_panel.grid_rowconfigure(2, weight=1)
+        self._build_ui()
+        self._connect_bridge()
+        self._apply_theme()
+        self._set_view_mode(True)
+        QTimer.singleShot(0, self._load_last_profile)
 
-        # Row 1: Global Sequence parameters labels & entry fields
-        ctk.CTkLabel(bot_panel, text="T Ramp (°C/s):", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, padx=(15, 5), pady=5, sticky="w")
-        self.t_ramp_edit = ctk.CTkEntry(bot_panel, width=122)
-        self.t_ramp_edit.insert(0, "0.1")
-        self.t_ramp_edit.grid(row=0, column=1, padx=5, pady=5, sticky="w")
-        self.t_ramp_edit.bind("<KeyRelease>", self.mark_profile_unsaved)
-        self.t_ramp_edit.bind("<FocusOut>", lambda e: self._validate_numeric_entry(self.t_ramp_edit, min_val=0.0001))
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(8)
 
-        ctk.CTkLabel(bot_panel, text="I Ramp (mA/s):", font=("Segoe UI", 14, "bold")).grid(row=1, column=0, padx=(15, 5), pady=5, sticky="w")
-        self.i_ramp_edit = ctk.CTkEntry(bot_panel, width=122)
-        self.i_ramp_edit.insert(0, "0.5")
-        self.i_ramp_edit.grid(row=1, column=1, padx=5, pady=5, sticky="w")
-        self.i_ramp_edit.bind("<KeyRelease>", self.mark_profile_unsaved)
-        self.i_ramp_edit.bind("<FocusOut>", lambda e: self._validate_numeric_entry(self.i_ramp_edit, min_val=0.0001))
+        # --- Top connection bar ---
+        top = QHBoxLayout()
+        lbl = QLabel("COM Port:"); lbl.setObjectName("hdr")
+        top.addWidget(lbl)
+        self.com_combo = QComboBox(); self.com_combo.setMinimumWidth(190)
+        self._refresh_ports()
+        top.addWidget(self.com_combo)
+        self.btn_refresh = QPushButton("↻"); self.btn_refresh.setFixedWidth(34)
+        self.btn_refresh.clicked.connect(self._refresh_ports)
+        top.addWidget(self.btn_refresh)
+        self.btn_connect = QPushButton("Connect"); self.btn_connect.clicked.connect(self.connect_serial)
+        top.addWidget(self.btn_connect)
+        self.btn_scan = QPushButton("Scan Channels"); self.btn_scan.setEnabled(False)
+        self.btn_scan.clicked.connect(self.start_scan)
+        top.addWidget(self.btn_scan)
+        self.btn_clear = QPushButton("Clear Faults"); self.btn_clear.setEnabled(False)
+        self.btn_clear.clicked.connect(self.clear_faults)
+        top.addWidget(self.btn_clear)
+        top.addStretch(1)
+        self.status_label = QLabel("Status: Disconnected")
+        self.status_label.setObjectName("hdr")
+        top.addWidget(self.status_label)
+        root.addLayout(top)
 
-        ctk.CTkLabel(bot_panel, text="T OFF Target (°C):", font=("Segoe UI", 14, "bold")).grid(row=0, column=2, padx=(20, 5), pady=5, sticky="w")
-        self.t_off_edit = ctk.CTkEntry(bot_panel, width=122)
-        self.t_off_edit.insert(0, "22.0")
-        self.t_off_edit.grid(row=0, column=3, padx=5, pady=5, sticky="w")
-        self.t_off_edit.bind("<KeyRelease>", self.mark_profile_unsaved)
-        self.t_off_edit.bind("<FocusOut>", lambda e: self._validate_numeric_entry(self.t_off_edit))
+        # --- Controls bar: title, view toggle, show-unused ---
+        bar = QHBoxLayout()
+        title = QLabel("Channel Configuration & Live Telemetry"); title.setObjectName("hdr")
+        title.setStyleSheet("font-size: 15px;")
+        bar.addWidget(title)
+        bar.addStretch(1)
 
-        # Profile configurations actions
-        self.btn_save = ctk.CTkButton(bot_panel, text="💾 Save Profile", width=162, command=self.save_config)
-        self.btn_save.grid(row=2, column=0, columnspan=2, padx=(15, 5), pady=10, sticky="w")
+        self.btn_view_table = QPushButton("Table"); self.btn_view_table.setObjectName("seg"); self.btn_view_table.setCheckable(True); self.btn_view_table.setChecked(True)
+        self.btn_view_cards = QPushButton("Cards"); self.btn_view_cards.setObjectName("seg"); self.btn_view_cards.setCheckable(True)
+        grp = QButtonGroup(self); grp.setExclusive(True); grp.addButton(self.btn_view_table); grp.addButton(self.btn_view_cards)
+        self.btn_view_table.clicked.connect(lambda: self._set_view_mode(True))
+        self.btn_view_cards.clicked.connect(lambda: self._set_view_mode(False))
+        seg = QHBoxLayout(); seg.setSpacing(0); seg.addWidget(self.btn_view_table); seg.addWidget(self.btn_view_cards)
+        bar.addLayout(seg)
+        bar.addSpacing(14)
 
-        self.btn_load = ctk.CTkButton(bot_panel, text="📂 Load Profile", width=162, command=self.load_config)
-        self.btn_load.grid(row=2, column=2, columnspan=2, padx=5, pady=10, sticky="w")
+        self.chk_show_unused = QCheckBox("Show unused")
+        self.chk_show_unused.stateChanged.connect(self._apply_visibility)
+        bar.addWidget(self.chk_show_unused)
+        root.addLayout(bar)
 
-        self.btn_clear_profile = ctk.CTkButton(bot_panel, text="❌ Clear Profile", width=162, command=self.clear_profile)
-        self.btn_clear_profile.grid(row=2, column=3, padx=5, pady=10, sticky="w")
+        # --- Scroll area with the reflowing card container + table header ---
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.container = QWidget()
+        self.cards_grid = QGridLayout(self.container)
+        self.cards_grid.setContentsMargins(4, 4, 4, 4)
+        self.cards_grid.setHorizontalSpacing(8)
+        self.cards_grid.setVerticalSpacing(8)
+        self.cards_grid.setAlignment(Qt.AlignTop)
+        self.scroll.setWidget(self.container)
+        root.addWidget(self.scroll, 1)
 
-        self.lbl_profile = ctk.CTkLabel(bot_panel, text="Active Profile: [Unsaved]", font=("Segoe UI", 15, "bold"), text_color="#888888")
-        self.lbl_profile.grid(row=2, column=4, padx=15, pady=10, sticky="w")
+        self.table_header = self._build_table_header()
+        self.cards = [ChannelCard(i, self) for i in range(self.num_channels)]
+        # Parent everything to the scroll container up front and start hidden, so
+        # _relayout only ever adds/removes from the layout and toggles visibility —
+        # never setParent(None), which would briefly turn a card into a top-level
+        # window (the "tiny windows flashing" bug).
+        self.table_header.setParent(self.container); self.table_header.hide()
+        for c in self.cards:
+            c.setParent(self.container); c.hide()
 
-        # Execution actions on the right side
-        self.btn_exec_all = ctk.CTkButton(bot_panel, text="▶ RUN ALL", font=("Segoe UI", 16, "bold"), fg_color="#2e7d32", hover_color="#1b5e20",
-                                           text_color="white", state="disabled", width=230, height=60, command=self.execute_all)
-        self.btn_exec_all.grid(row=0, column=6, rowspan=2, padx=10, pady=10, sticky="nsew")
+        # --- Bottom panel: [ params + profile stacked ] ... [ presets | EMO | Run ] ---
+        bottom = QHBoxLayout(); bottom.setSpacing(16)
 
-        self.btn_stop = ctk.CTkButton(bot_panel, text="⏹ CANCEL RUN (Safe)", font=("Segoe UI", 15, "bold"), fg_color="#c62828", hover_color="#b71c1c",
-                                       text_color="white", state="disabled", width=230, command=self.stop_execution)
-        self.btn_stop.grid(row=2, column=6, padx=10, pady=10, sticky="nsew")
+        # Left column: params row, then the profile row directly beneath it. A
+        # stretch above and below centers the pair vertically against the taller
+        # presets/Run block on the right (no lopsided gap under the profile row).
+        left = QVBoxLayout(); left.setSpacing(8)
+        left.addStretch(1)
+        params = QHBoxLayout(); params.setSpacing(8)
 
-        # Emergency Laser Off
-        self.btn_emerg = ctk.CTkButton(bot_panel, text="⚠\nEMO\nOFF", font=("Segoe UI", 13, "bold"), fg_color="#c62828", hover_color="#b71c1c",
-                                        text_color="white", state="disabled", width=81, command=self.emergency_las_off)
-        self.btn_emerg.grid(row=0, column=5, rowspan=3, padx=10, pady=10, sticky="nsew")
+        def add_param(label, attr, default):
+            L = QLabel(label); L.setObjectName("hdr"); params.addWidget(L)
+            e = QLineEdit(default); e.setFixedWidth(72); e.setValidator(QDoubleValidator())
+            e.textEdited.connect(self._mark_unsaved)
+            setattr(self, attr, e); params.addWidget(e)
+        add_param("T Ramp (°C/s):", "t_ramp", "0.1")
+        add_param("I Ramp (mA/s):", "i_ramp", "0.5")
+        add_param("T OFF Target (°C):", "t_off", "22.0")
+        params.addStretch(1)
+        left.addLayout(params)
 
-    # ----------------------------------------------------
-    # CHANNEL CARD LAYOUT (responsive reflow)
-    # ----------------------------------------------------
-    # Column spec for Table view (and its header): (title, min logical width, weight).
-    # Index == grid column. The Status column stretches to absorb extra width.
-    _TABLE_COLS = [
-        ("Ch", 44, 0), ("En", 30, 0), ("Label", 120, 0), ("", 24, 0), ("Status", 150, 1),
-        ("Live TEC", 62, 0), ("Live LAS", 62, 0), ("Live T", 62, 0), ("Live I", 62, 0),
-        ("TEC", 62, 0), ("LAS", 62, 0), ("Tgt T", 58, 0), ("Max", 40, 0),
-        ("Tgt I", 58, 0), ("Max", 40, 0), ("Action", 92, 0),
-    ]
+        profile = QHBoxLayout(); profile.setSpacing(8)
+        self.lbl_profile = QLabel("Active Profile: [Unsaved]"); self.lbl_profile.setObjectName("hdr")
+        profile.addWidget(self.lbl_profile)
+        self.btn_save = QPushButton("💾 Save Profile"); self.btn_save.clicked.connect(self.save_profile)
+        profile.addWidget(self.btn_save)
+        self.btn_load = QPushButton("📂 Load Profile"); self.btn_load.clicked.connect(self.load_profile)
+        profile.addWidget(self.btn_load)
+        self.btn_clear_prof = QPushButton("❌ Clear Profile"); self.btn_clear_prof.clicked.connect(self.clear_profile)
+        profile.addWidget(self.btn_clear_prof)
+        profile.addStretch(1)
+        left.addLayout(profile)
+        left.addStretch(1)
+        bottom.addLayout(left)
 
-    def _build_channel_card(self, i):
-        """Create one channel's widgets inside a card frame. Returns the ch_ui dict
-        with the SAME keys the scan/telemetry/sequence code expects, plus 'card' (the
-        frame) and '_caps' (compact-view caption labels). The widgets are NOT gridded
-        here — _layout_compact()/_layout_table_row() arrange them per the view mode."""
-        ch_idx = i + 1
-        card = ctk.CTkFrame(self.cards_container, corner_radius=8, border_width=1,
-                            border_color=("#d0d0d0", "#3f3f3f"))
-        muted = theme.status("muted")
+        bottom.addStretch(1)
 
-        caps = []  # (widget, compact_col, compact_row, sticky) — shown only in card view
+        # Bulk target presets: these only SET each channel's Target TEC/LAS; they
+        # do not actuate hardware — the run happens when you press Run All. The
+        # framed group + caption + placement next to Run All make that explicit.
+        preset = QFrame(); preset.setObjectName("card")
+        pv = QVBoxLayout(preset); pv.setContentsMargins(10, 6, 10, 8); pv.setSpacing(3)
+        ph = QLabel("Bulk-set Target TEC / LAS"); ph.setObjectName("hdr")
+        pv.addWidget(ph)
+        pc = QLabel("Sets targets only — press ▶ RUN ALL to apply"); pc.setObjectName("caption")
+        pv.addWidget(pc)
+        mgrid = QGridLayout(); mgrid.setSpacing(4)
+        self._master_buttons = []
 
-        def cap(text, col, row, sticky="s"):
-            lbl = ctk.CTkLabel(card, text=text, font=("Segoe UI", 11), text_color=muted)
-            caps.append((lbl, col, row, sticky))
-            return lbl
+        def mkmaster(text, fn, kind, r, c):
+            b = QPushButton(text); b.setEnabled(False); b.setFixedWidth(82); b.clicked.connect(fn)
+            if kind == "green":
+                b.setStyleSheet("background:#2e7d32; color:white; font-weight:600;")
+            elif kind == "red":
+                b.setStyleSheet("background:#c62828; color:white; font-weight:600;")
+            mgrid.addWidget(b, r, c)
+            self._master_buttons.append(b)
 
-        lbl_ch = ctk.CTkLabel(card, text=f"Ch {ch_idx}", font=("Segoe UI", 15, "bold"))
-        ent_label = ctk.CTkEntry(card, placeholder_text=f"Laser {ch_idx}", state="disabled")
-        ent_label.insert(0, f"Laser {ch_idx}")
-        ent_label.bind("<KeyRelease>", self.mark_profile_unsaved)
-        var_enable = tk.BooleanVar(value=False)
-        chk_enable = ctk.CTkCheckBox(card, text="", width=24, variable=var_enable,
-                                     state="disabled", command=self._on_enable_toggle)
-        led = LEDIndicator(card, size=18, color=theme.led("idle"))
-        lbl_status = ctk.CTkLabel(card, text="Run Scan First", text_color=muted,
-                                  font=("Segoe UI", 14), anchor="w")
+        mkmaster("All On", lambda: self.set_all_systems("ON"), "green", 0, 0)
+        mkmaster("TEC On", lambda: self.set_all_dropdowns("TEC", "ON"), "", 0, 1)
+        mkmaster("LAS On", lambda: self.set_all_dropdowns("LAS", "ON"), "", 0, 2)
+        mkmaster("All Off", lambda: self.set_all_systems("OFF"), "red", 1, 0)
+        mkmaster("TEC Off", lambda: self.set_all_dropdowns("TEC", "OFF"), "", 1, 1)
+        mkmaster("LAS Off", lambda: self.set_all_dropdowns("LAS", "OFF"), "", 1, 2)
+        pv.addLayout(mgrid)
+        bottom.addWidget(preset)
 
-        cap("Live TEC", 0, 2); cap("Live LAS", 1, 2); cap("Live T °C", 2, 2); cap("Live I mA", 3, 2)
-        ent_live_tec = ctk.CTkEntry(card, width=72, state="disabled", font=("Segoe UI", 13, "bold"),
-                                    justify="center", fg_color=theme.LIVE_IDLE_BG, text_color=theme.LIVE_IDLE_TEXT)
-        set_entry_val(ent_live_tec, "OFF")
-        ent_live_las = ctk.CTkEntry(card, width=72, state="disabled", font=("Segoe UI", 13, "bold"),
-                                    justify="center", fg_color=theme.LIVE_IDLE_BG, text_color=theme.LIVE_IDLE_TEXT)
-        set_entry_val(ent_live_las, "OFF")
-        ent_live_t = ctk.CTkEntry(card, width=72, state="disabled", font=("Segoe UI", 16), justify="right")
-        set_entry_val(ent_live_t, "0.0")
-        ent_live_i = ctk.CTkEntry(card, width=72, state="disabled", font=("Segoe UI", 16), justify="right")
-        set_entry_val(ent_live_i, "0.0")
+        self.btn_emo = QPushButton("⚠  EMO OFF"); self.btn_emo.setEnabled(False)
+        self.btn_emo.setFixedWidth(140); self.btn_emo.setMinimumHeight(92)
+        self.btn_emo.setStyleSheet("background:#b71c1c; color:white; font-size:14px; "
+                                   "font-weight:bold; border-radius:8px; padding:6px 8px;")
+        self.btn_emo.clicked.connect(self.emergency_las_off)
+        bottom.addWidget(self.btn_emo)
 
-        cap("TEC", 0, 4); cap("LAS", 1, 4); cap("Target T", 2, 4); cap("Target I", 3, 4)
-        opt_tec = ctk.CTkOptionMenu(card, values=["ON", "OFF"], width=72, state="disabled",
-                                    command=self.mark_profile_unsaved)
-        opt_tec.set("OFF")
-        opt_las = ctk.CTkOptionMenu(card, values=["ON", "OFF"], width=72, state="disabled",
-                                    command=self.mark_profile_unsaved)
-        opt_las.set("OFF")
-        ent_target_t = ctk.CTkEntry(card, width=72, state="disabled", justify="right")
-        ent_target_t.insert(0, "22.0")
-        ent_target_t.bind("<KeyRelease>", self.mark_profile_unsaved)
-        ent_target_t.bind("<FocusOut>", lambda e, w=ent_target_t: self._validate_numeric_entry(w))
-        ent_target_i = ctk.CTkEntry(card, width=72, state="disabled", justify="right")
-        ent_target_i.insert(0, "0.0")
-        ent_target_i.bind("<KeyRelease>", self.mark_profile_unsaved)
-        ent_target_i.bind("<FocusOut>", lambda e, w=ent_target_i: self._validate_numeric_entry(w))
+        run_col = QVBoxLayout(); run_col.setSpacing(6)
+        self.btn_run_all = QPushButton("▶ RUN ALL"); self.btn_run_all.setEnabled(False)
+        self.btn_run_all.setMinimumHeight(56); self.btn_run_all.setMinimumWidth(210)
+        self.btn_run_all.setStyleSheet("background:#2e7d32; color:white; font-size:16px; font-weight:bold; border-radius:8px;")
+        self.btn_run_all.clicked.connect(self.execute_all)
+        run_col.addWidget(self.btn_run_all)
+        self.btn_stop = QPushButton("⏹ CANCEL RUN (Safe)"); self.btn_stop.setEnabled(False)
+        self.btn_stop.setMinimumHeight(30)
+        self.btn_stop.setStyleSheet("background:#c62828; color:white; font-weight:bold; border-radius:8px;")
+        self.btn_stop.clicked.connect(self.stop_execution)
+        run_col.addWidget(self.btn_stop)
+        bottom.addLayout(run_col)
 
-        cap("Max limit:", 1, 6, sticky="e")
-        lbl_max_t = ctk.CTkLabel(card, text="-", font=("Segoe UI", 13), text_color=muted)
-        lbl_max_i = ctk.CTkLabel(card, text="-", font=("Segoe UI", 13), text_color=muted)
-
-        btn_run_ch = ctk.CTkButton(card, text="▶ Run Ch.", width=92, state="disabled",
-                                   command=lambda ch=ch_idx: self.execute_single_channel(ch))
-
-        return {
-            'card': card, '_caps': caps,
-            'label_num': lbl_ch, 'enable_var': var_enable, 'enable_chk': chk_enable,
-            'laser_label': ent_label, 'led': led, 'status': lbl_status,
-            'live_tec': ent_live_tec, 'live_las': ent_live_las,
-            'cur_t': ent_live_t, 'cur_i': ent_live_i,
-            'tec_cmd': opt_tec, 'las_cmd': opt_las,
-            't_target': ent_target_t, 't_lim': lbl_max_t,
-            'i_target': ent_target_i, 'i_lim': lbl_max_i, 'btn_exec': btn_run_ch,
-        }
-
-    def _clear_card_grid(self, card):
-        for w in card.grid_slaves():
-            w.grid_forget()
-
-    def _layout_compact(self, ch):
-        """Card view: a compact block, 4 internal columns."""
-        card = ch['card']
-        self._clear_card_grid(card)
-        for c in range(len(self._TABLE_COLS)):
-            card.grid_columnconfigure(c, weight=0, minsize=0)
-        for c in range(4):
-            card.grid_columnconfigure(c, weight=1, minsize=0)
-
-        ch['label_num'].grid(row=0, column=0, padx=(10, 4), pady=(8, 2), sticky="w")
-        ch['laser_label'].grid(row=0, column=1, columnspan=2, padx=4, pady=(8, 2), sticky="ew")
-        ch['enable_chk'].grid(row=0, column=3, padx=(4, 10), pady=(8, 2), sticky="e")
-        ch['led'].grid(row=1, column=0, padx=(10, 4), pady=2, sticky="w")
-        ch['status'].grid(row=1, column=1, columnspan=3, padx=4, pady=2, sticky="ew")
-        for lbl, col, row, sticky in ch['_caps']:
-            lbl.grid(row=row, column=col, padx=2, pady=(6, 0), sticky=sticky)
-        ch['live_tec'].grid(row=3, column=0, padx=2, pady=2, sticky="ew")
-        ch['live_las'].grid(row=3, column=1, padx=2, pady=2, sticky="ew")
-        ch['cur_t'].grid(row=3, column=2, padx=2, pady=2, sticky="ew")
-        ch['cur_i'].grid(row=3, column=3, padx=2, pady=2, sticky="ew")
-        ch['tec_cmd'].grid(row=5, column=0, padx=2, pady=2, sticky="ew")
-        ch['las_cmd'].grid(row=5, column=1, padx=2, pady=2, sticky="ew")
-        ch['t_target'].grid(row=5, column=2, padx=2, pady=2, sticky="ew")
-        ch['i_target'].grid(row=5, column=3, padx=2, pady=2, sticky="ew")
-        ch['t_lim'].grid(row=6, column=2, padx=2, pady=(0, 2))
-        ch['i_lim'].grid(row=6, column=3, padx=2, pady=(0, 2))
-        ch['btn_exec'].grid(row=7, column=0, columnspan=4, padx=10, pady=(6, 10), sticky="ew")
-
-    def _layout_table_row(self, ch):
-        """Table view: one full-width horizontal row, columns aligned with the header."""
-        card = ch['card']
-        self._clear_card_grid(card)
-        for c, (_, minsize, weight) in enumerate(self._TABLE_COLS):
-            card.grid_columnconfigure(c, minsize=minsize, weight=weight)
-
-        order = ['label_num', 'enable_chk', 'laser_label', 'led', 'status',
-                 'live_tec', 'live_las', 'cur_t', 'cur_i', 'tec_cmd', 'las_cmd',
-                 't_target', 't_lim', 'i_target', 'i_lim', 'btn_exec']
-        for col, key in enumerate(order):
-            sticky = "w" if key in ('label_num', 'status') else "ew"
-            ch[key].grid(row=0, column=col, padx=2, pady=4, sticky=sticky)
+        root.addLayout(bottom)
 
     def _build_table_header(self):
-        """A single header row shown above the stacked channel rows in Table view."""
-        self.table_header = ctk.CTkFrame(self.cards_container, fg_color="transparent")
-        for c, (title, minsize, weight) in enumerate(self._TABLE_COLS):
-            self.table_header.grid_columnconfigure(c, minsize=minsize, weight=weight)
-            ctk.CTkLabel(self.table_header, text=title, font=("Segoe UI", 12, "bold"),
-                         anchor="w").grid(row=0, column=c, padx=2, pady=(2, 2), sticky="w")
+        h = QFrame(); h.setObjectName("tableHeader")
+        # Margins + spacing must match ChannelCard's table-mode grid so the header
+        # columns line up exactly with the row columns.
+        g = QGridLayout(h); g.setContentsMargins(10, 4, 10, 4); g.setHorizontalSpacing(10)
+        for c, (title, w, align) in enumerate(TABLE_COLS):
+            g.setColumnMinimumWidth(c, w)
+            lab = QLabel(title); lab.setObjectName("caption")
+            lab.setAlignment(align)
+            if c != STATUS_COL:
+                lab.setFixedWidth(w)   # match the row widgets so labels line up
+            g.addWidget(lab, 0, c)
+        g.setColumnStretch(STATUS_COL, 1)
+        return h
 
-    def _set_view_mode(self, mode):
-        """Switch between 'Table' (full-width stacked rows) and 'Cards' (compact grid)."""
-        self._table_mode = (mode == "Table")
-        for ch in self.ch_ui:
-            (self._layout_table_row if self._table_mode else self._layout_compact)(ch)
-        self._reflow_cards(force=True)
+    def _connect_bridge(self):
+        self.bridge.status.connect(self._on_status)
+        self.bridge.led.connect(self._on_led)
+        self.bridge.liveOutput.connect(self._on_live_output)
+        self.bridge.liveValue.connect(self._on_live_value)
+        self.bridge.tick.connect(self.update_eta)
+        self.bridge.halted.connect(self._on_halted)
+        self.bridge.fault.connect(self._on_fault)
+        self.bridge.post.connect(lambda fn: fn())
 
-    def _shown_indices(self):
-        """Which channel cards should be visible right now. Before the first scan,
-        or when 'Show unused' is on, show all. Otherwise show only populated +
-        enabled channels (hiding empty slots, no-laser cards, and disabled ones)."""
-        if self.show_unused_var.get() or not self._has_scanned:
+    def _post(self, fn, *args):
+        self.bridge.post.emit(lambda: fn(*args))
+
+    # ------------------------------------------------------------------
+    # View mode + reflow + visibility
+    # ------------------------------------------------------------------
+    def _set_view_mode(self, table):
+        self._table_mode = table
+        for card in self.cards:
+            card.set_table_mode() if table else card.set_card_mode()
+        self._relayout(force=True)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout()
+
+    def _shown(self):
+        if self.chk_show_unused.isChecked() or not self.has_scanned:
             return list(range(self.num_channels))
         return [i for i in range(self.num_channels)
-                if self.ch_populated[i] and self.ch_ui[i]['enable_var'].get()]
+                if self.populated[i] and self.cards[i].enable.isChecked()]
 
-    def _reflow_cards(self, event=None, force=False):
-        """Place the visible channel cards. In Table view they stack full-width under
-        a shared header; in Cards view they reflow into as many columns as fit the
-        current width (down to one on a laptop / quarter-screen window)."""
-        if not getattr(self, "ch_ui", None):
+    def _relayout(self, force=False):
+        if not getattr(self, "cards", None):
             return
-        shown = self._shown_indices()
+        shown = self._shown()
+        if self._table_mode:
+            cols = 1
+        else:
+            vw = self.scroll.viewport().width()
+            cols = max(1, min(vw // CARD_W, max(1, len(shown))))
+        key = (self._table_mode, cols, tuple(shown))
+        if not force and key == getattr(self, "_relayout_key", None):
+            return
+        self._relayout_key = key
 
-        if getattr(self, "_table_mode", True):
-            key = ("table", tuple(shown))
-            if not force and key == self._reflow_key:
-                return
-            self._reflow_key = key
-            for c in range(len(self._TABLE_COLS)):
-                self.cards_container.grid_columnconfigure(c, weight=(1 if c == 0 else 0), minsize=0)
-            for i in range(self.num_channels):
-                self.ch_ui[i]['card'].grid_forget()
-            self.table_header.grid(row=0, column=0, sticky="ew", padx=8, pady=(2, 0))
+        # Remove all items from the layout (widgets stay children of the container,
+        # so nothing becomes a top-level window / flashes).
+        while self.cards_grid.count():
+            self.cards_grid.takeAt(0)
+        for c in range(max(4, self.cards_grid.columnCount())):
+            self.cards_grid.setColumnStretch(c, 0)
+
+        shown_set = set(shown)
+        if self._table_mode:
+            self.cards_grid.setColumnStretch(0, 1)
+            self.cards_grid.addWidget(self.table_header, 0, 0)
+            self.table_header.setVisible(True)
             for pos, i in enumerate(shown):
-                self.ch_ui[i]['card'].grid(row=pos + 1, column=0, padx=8, pady=3, sticky="ew")
-            return
-
-        # Cards view: compute columns from the viewport width (physical px -> logical
-        # via the HiDPI widget-scaling factor).
-        self.table_header.grid_forget()
-        canvas = getattr(self.cards_container, "_parent_canvas", None)
-        px_width = canvas.winfo_width() if canvas is not None else self.cards_container.winfo_width()
-        if px_width <= 1:
-            self.after(100, lambda: self._reflow_cards(force=True))
-            return
-        try:
-            scaling = ctk.ScalingTracker.get_widget_scaling(self.cards_container)
-        except Exception:
-            scaling = 1.0
-        width = px_width / max(scaling, 0.1)
-
-        CARD_W = 360
-        cols = max(1, min(int(width // CARD_W), max(1, len(shown))))
-        key = ("cards", cols, tuple(shown))
-        if not force and key == self._reflow_key:
-            return
-        self._reflow_key = key
-
-        for c in range(max(cols, len(self._TABLE_COLS))):
-            self.cards_container.grid_columnconfigure(c, weight=(1 if c < cols else 0), minsize=0)
+                self.cards_grid.addWidget(self.cards[i], pos + 1, 0)
+        else:
+            self.table_header.setVisible(False)
+            for c in range(cols):
+                self.cards_grid.setColumnStretch(c, 1)
+            for pos, i in enumerate(shown):
+                r, c = divmod(pos, cols)
+                self.cards_grid.addWidget(self.cards[i], r, c)
         for i in range(self.num_channels):
-            self.ch_ui[i]['card'].grid_forget()
-        for pos, i in enumerate(shown):
-            r, c = divmod(pos, cols)
-            self.ch_ui[i]['card'].grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+            self.cards[i].setVisible(i in shown_set)
 
-    def _on_enable_toggle(self):
-        """User toggled a channel's Enable box: re-evaluate card visibility."""
-        self._reflow_cards(force=True)
+    def _apply_visibility(self, *_):
+        self._relayout(force=True)
 
-    # ----------------------------------------------------
-    # INPUT VALIDATION HELPERS
-    # ----------------------------------------------------
-    def _validate_numeric_entry(self, widget, min_val=None, max_val=None):
-        """Visual validation for numeric CTkEntry fields. Highlights red on invalid input."""
-        raw = widget.get().strip()
-        valid = True
-        try:
-            val = float(raw)
-            if min_val is not None and val <= min_val - 1e-9:
-                valid = False
-            if max_val is not None and val > max_val:
-                valid = False
-        except ValueError:
-            valid = False
+    def _on_enable_changed(self, *_):
+        self._relayout(force=True)
 
-        if valid:
-            widget.configure(border_color=("#979da2", "#565b5e"))  # default
+    # ------------------------------------------------------------------
+    # Bridge slots
+    # ------------------------------------------------------------------
+    def _on_status(self, idx, text, kind):
+        s = self.cards[idx].status
+        s.setText(text)
+        s.setStyleSheet(f"color: {status_hex(kind, self.dark)};")
+
+    def _on_led(self, idx, kind):
+        self.cards[idx].led.set_kind(kind)
+
+    def _on_live_output(self, idx, kind, state):
+        w = self.cards[idx].live_tec if kind == "TEC" else self.cards[idx].live_las
+        w.setText(state)
+        if state == "ON":
+            w.setStyleSheet("background:#2e7d32; color:white; border-radius:6px; padding:2px;")
         else:
-            widget.configure(border_color="#c62828")  # red highlight
-        return valid
+            muted_bg = "#33373c" if self.dark else "#e6e6e6"
+            muted_fg = "#9aa0a6" if self.dark else "#606060"
+            w.setStyleSheet(f"background:{muted_bg}; color:{muted_fg}; border-radius:6px; padding:2px;")
 
-    # ----------------------------------------------------
-    # PROFILE SETTING HELPERS
-    # ----------------------------------------------------
-    def mark_profile_unsaved(self, *args):
-        text = self.lbl_profile.cget("text")
-        if not text.startswith("* "):
-            self.lbl_profile.configure(text=f"* {text}", text_color="#f57c00")
+    def _on_live_value(self, idx, kind, value):
+        (self.cards[idx].live_t if kind == "T" else self.cards[idx].live_i).setText(f"{value:.1f}")
 
-    def refresh_ports(self):
-        self.avail_ports = [port.device for port in serial.tools.list_ports.comports()]
-        self.avail_ports.append("Demo Simulator")
-        self.com_dropdown.configure(values=self.avail_ports)
-        real_ports = [p for p in self.avail_ports if p != "Demo Simulator"]
-        if real_ports:
-            self.com_dropdown.set(real_ports[0])
-        else:
-            self.com_dropdown.set("Demo Simulator")
+    def _on_halted(self, idx):
+        c = self.cards[idx]
+        self._on_status(idx, f"HALTED at {c.live_t.text()}°C, {c.live_i.text()}mA", "fault")
+        self._triple_bell()
 
-    def set_appearance(self, mode):
-        """Switch the light/dark theme at runtime. CustomTkinter widgets defined
-        with (light, dark) colors auto-switch; the custom LED canvases, which CTk
-        does not theme, are refreshed manually."""
-        ctk.set_appearance_mode(mode)
-        for ch in self.ch_ui:
-            ch["led"].refresh_theme()
+    def _on_fault(self, idx, message):
+        self._on_status(idx, message, "fault")
+        self._on_led(idx, "fault")
+        print(f"[Hardware Fault] Channel {idx + 1}: {message}")
+        self._triple_bell()
 
-    def load_last_profile_preference(self):
-        pref_file = os.path.join(os.path.expanduser("~"), ".ldc_laser_control_prefs.json")
-        if os.path.exists(pref_file):
-            try:
-                with open(pref_file, "r") as f:
-                    prefs = json.load(f)
-                    last_path = prefs.get("LastProfilePath", "")
-                    if last_path and os.path.isfile(last_path):
-                        self.load_profile_from_file(last_path)
-            except Exception as e:
-                print(f"Error loading preferences: {e}")
+    def _triple_bell(self):
+        QApplication.beep()
+        QTimer.singleShot(150, QApplication.beep)
+        QTimer.singleShot(300, QApplication.beep)
 
-    def save_last_profile_preference(self, path):
-        pref_file = os.path.join(os.path.expanduser("~"), ".ldc_laser_control_prefs.json")
-        try:
-            with open(pref_file, "w") as f:
-                json.dump({"LastProfilePath": path}, f)
-        except Exception as e:
-            print(f"Error saving preferences: {e}")
+    # ------------------------------------------------------------------
+    # Connection / ports
+    # ------------------------------------------------------------------
+    def _refresh_ports(self):
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        ports.append("Demo Simulator")
+        self.com_combo.clear(); self.com_combo.addItems(ports)
+        real = [p for p in ports if p != "Demo Simulator"]
+        self.com_combo.setCurrentText(real[0] if real else "Demo Simulator")
 
-    def save_config(self):
-        file_path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files", "*.txt")])
-        if not file_path:
-            return
-        
-        try:
-            config_data = {
-                "COM_Port": self.com_dropdown.get(),
-                "T_ramp": float(self.t_ramp_edit.get()),
-                "I_ramp": float(self.i_ramp_edit.get()),
-                "T_OFF_Target": float(self.t_off_edit.get()),
-                "channels": []
-            }
-            for ch in self.ch_ui:
-                config_data["channels"].append({
-                    "T_Target": float(ch["t_target"].get()),
-                    "I_Target": float(ch["i_target"].get()),
-                    "Label": ch["laser_label"].get()
-                })
+    def _set_status(self, text):
+        self.status_label.setText(text)
 
-            with open(file_path, "w") as f:
-                json.dump(config_data, f, indent=2)
-
-            self.active_profile_path = file_path
-            self.save_last_profile_preference(file_path)
-            name = os.path.basename(file_path)
-            self.lbl_profile.configure(text=f"Active Profile: {name}", text_color="#888888")
-            
-            messagebox.showinfo("Profile Saved", "Hardware configuration profile has been saved successfully.")
-        except Exception as e:
-            messagebox.showerror("Save Error", f"Failed to save profile:\n{e}")
-
-    def load_config(self):
-        file_path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
-        if not file_path:
-            return
-        self.load_profile_from_file(file_path)
-
-    def load_profile_from_file(self, file_path):
-        try:
-            with open(file_path, "r") as f:
-                config_data = json.load(f)
-
-            saved_channels = len(config_data["channels"])
-            if saved_channels != self.num_channels:
-                msg = f"Profile Mismatch: The profile contains settings for {saved_channels} channels, but the GUI is configured for {self.num_channels} channels.\n\nApply compatible settings anyway?"
-                if not messagebox.askyesno("Channel Count Mismatch", msg):
-                    return
-
-            if "COM_Port" in config_data:
-                com_port = config_data["COM_Port"]
-                if com_port not in self.avail_ports:
-                    # Update available ports to include the one from the profile if missing
-                    self.avail_ports.append(com_port)
-                    self.com_dropdown.configure(values=self.avail_ports)
-                self.com_dropdown.set(com_port)
-
-            self.t_ramp_edit.delete(0, tk.END)
-            self.t_ramp_edit.insert(0, str(config_data["T_ramp"]))
-            self.i_ramp_edit.delete(0, tk.END)
-            self.i_ramp_edit.insert(0, str(config_data["I_ramp"]))
-            self.t_off_edit.delete(0, tk.END)
-            self.t_off_edit.insert(0, str(config_data["T_OFF_Target"]))
-
-            apply_count = min(saved_channels, self.num_channels)
-            for k in range(apply_count):
-                ch = self.ch_ui[k]
-                ch_cfg = config_data["channels"][k]
-                
-                # Update target entries safely
-                set_entry_val(ch["t_target"], str(ch_cfg["T_Target"]))
-                set_entry_val(ch["i_target"], str(ch_cfg["I_Target"]))
-                set_entry_val(ch["laser_label"], ch_cfg.get("Label", f"Laser {k+1}"))
-
-            self.active_profile_path = file_path
-            self.save_last_profile_preference(file_path)
-            name = os.path.basename(file_path)
-            self.lbl_profile.configure(text=f"Active Profile: {name}", text_color="#888888")
-
-            # If disconnected, the user shouldn't edit live channel configs until they connect
-            if self.btn_connect.cget("text") == "Disconnect" and not self.is_scanning:
-                self.lock_ui("normal")
-            else:
-                self.lock_ui("disabled")
-
-            # P3 #12: Show success popup to match MATLAB behaviour
-            messagebox.showinfo("Profile Loaded", f'Hardware configuration profile "{name}" has been loaded.')
-        except Exception as e:
-            messagebox.showerror("Load Error", f"Failed to load config file. It might be corrupted or outdated:\n{e}")
-
-    def clear_profile(self):
-        if not messagebox.askyesno("Confirm Clear", "Are you sure you want to clear the active profile and reset all settings to defaults?"):
-            return
-        
-        self.t_ramp_edit.delete(0, tk.END)
-        self.t_ramp_edit.insert(0, "0.1")
-        self.i_ramp_edit.delete(0, tk.END)
-        self.i_ramp_edit.insert(0, "0.5")
-        self.t_off_edit.delete(0, tk.END)
-        self.t_off_edit.insert(0, "22.0")
-
-        for k, ch in enumerate(self.ch_ui):
-            set_entry_val(ch["t_target"], "22.0")
-            set_entry_val(ch["i_target"], "0.0")
-            set_entry_val(ch["laser_label"], f"Laser {k+1}")
-
-        pref_file = os.path.join(os.path.expanduser("~"), ".ldc_laser_control_prefs.json")
-        if os.path.exists(pref_file):
-            try:
-                os.remove(pref_file)
-            except:
-                pass
-        self.active_profile_path = ""
-        self.lbl_profile.configure(text="Active Profile: [Default/Cleared]", text_color="#888888")
-
-    # ----------------------------------------------------
-    # SERIAL COMMUNICATION INTERFACE
-    # ----------------------------------------------------
     def connect_serial(self):
-        # Don't permit disconnect during sequence execution
         if self.is_executing:
-            if self.is_stop_requested:
-                self.status_label.configure(text="Status: WAITING for halt...", text_color="#f57c00")
-            else:
-                self.status_label.configure(text="Status: PRESS STOP BEFORE DISCONNECTING!", text_color="#c62828")
+            self._set_status("Status: PRESS STOP BEFORE DISCONNECTING!")
             return
-
-        # Handle Disconnect
-        if self.btn_connect.cget("text") == "Disconnect":
+        if self.btn_connect.text() == "Disconnect":
             self.disconnect_serial()
             return
-
-        # Handle Connect
-        port_choice = self.com_dropdown.get()
-
-        if port_choice == "Demo Simulator":
+        choice = self.com_combo.currentText()
+        if choice == "Demo Simulator":
             self.ctl.open_simulator()
-            self.status_label.configure(text="Status: Demo Mode Active", text_color="#7b1fa2")
-            self.btn_connect.configure(text="Disconnect", fg_color="#c62828", hover_color="#b71c1c")
-            self.com_dropdown.configure(state="disabled")
-            self.btn_scan.configure(state="normal")
-            self.btn_clear_faults.configure(state="normal")
-            return
-
-        try:
-            self.ctl.open(port_choice, baudrate=9600, timeout=5.0)
-            self.status_label.configure(text="Status: Connected (Ready)", text_color="#2e7d32")
-            self.btn_connect.configure(text="Disconnect", fg_color="#c62828", hover_color="#b71c1c")
-            self.com_dropdown.configure(state="disabled")
-            self.btn_scan.configure(state="normal")
-            self.btn_clear_faults.configure(state="normal")
-        except Exception as e:
-            self.status_label.configure(text="Status: Connection Failed", text_color="#c62828")
-            messagebox.showerror("Connection Error", f"Failed to connect to {port_choice}:\n{e}")
+            self._set_status("Status: Demo Mode Active")
+        else:
+            try:
+                self.ctl.open(choice, baudrate=9600, timeout=5.0)
+            except Exception as e:
+                QMessageBox.critical(self, "Connection Error", f"Failed to connect to {choice}:\n{e}")
+                self._set_status("Status: Connection Failed")
+                return
+            self._set_status("Status: Connected (Ready)")
+        self.btn_connect.setText("Disconnect")
+        self.com_combo.setEnabled(False)
+        self.btn_scan.setEnabled(True)
+        self.btn_clear.setEnabled(True)
 
     def disconnect_serial(self):
         self.telemetry_active = False
         if self.telemetry_thread and self.telemetry_thread.is_alive():
             self.telemetry_thread.join(timeout=1.0)
-        
-        with self.serial_lock:
-            if self.ser:
-                try:
-                    self.ser.close()
-                except:
-                    pass
-                self.ser = None
+        self.ctl.close()
+        self._set_status("Status: Disconnected")
+        self.btn_connect.setText("Connect")
+        self.com_combo.setEnabled(True)
+        self.btn_scan.setEnabled(False)
+        self.btn_clear.setEnabled(False)
+        self.btn_run_all.setEnabled(False)
+        self._lock_controls(False)
+        self.has_scanned = False
+        for i in range(self.num_channels):
+            self._mark_empty(i, "Disconnected")
+        self._relayout(force=True)
 
-        self.is_simulated = False
-        self.status_label.configure(text="Status: Disconnected", text_color="#c62828")
-        self.btn_connect.configure(text="Connect", fg_color="#1976D2")
-        self.com_dropdown.configure(state="normal")
-        self.btn_scan.configure(state="disabled")
-        self.btn_clear_faults.configure(state="disabled")
-        self.btn_exec_all.configure(state="disabled")
-        self.lock_ui("disabled")
-
-        # Reset all rows to disconnected look
-        for idx in range(self.num_channels):
-            self.mark_empty(idx, "Disconnected")
-
-        # Nothing is known to be populated anymore; show every card again.
-        self._has_scanned = False
-        self._reflow_cards(force=True)
-
-
-    # ----------------------------------------------------
-    # CHASSIS INTERROGATOR (SCAN CHANNELS)
-    # ----------------------------------------------------
-    def start_channel_scan(self):
+    # ------------------------------------------------------------------
+    # Scan
+    # ------------------------------------------------------------------
+    def start_scan(self):
         self.is_scanning = True
-        self.btn_scan.configure(state="disabled")
-        # Keep connect button enabled so user can disconnect and abort if hung
-        self.btn_exec_all.configure(state="disabled")
-        self.lock_ui("disabled")
-        self.status_label.configure(text="Status: Scanning active hardware...", text_color="#f57c00")
-        
-        # Run scan loop in a background thread to prevent UI freezing
-        threading.Thread(target=self.run_channel_scan, daemon=True).start()
+        self.btn_scan.setEnabled(False)
+        self._set_status("Status: Scanning active hardware...")
+        threading.Thread(target=self._run_scan, daemon=True).start()
 
-    def run_channel_scan(self):
-        cards_found = 0
-        
+    def _run_scan(self):
+        cards = 0
         for k in range(self.num_channels):
-            if self.is_closing or (not self.ser and not self.is_simulated):
+            if self.is_closing or not self.ctl.is_connected:
                 break
             ch_num = k + 1
-            
-            with self.serial_lock:
+            with self.ctl.serial_lock:
                 try:
-                    # Flush buffer
-                    if not self.is_simulated and self.ser:
-                        self.ser.reset_input_buffer()
-                    
-                    # P0 #2: Use cmd_pause (send + 0.15s wait) to match MATLAB cmdPause,
-                    # then an extra 0.1s settling before querying — total 0.25s as in MATLAB.
-                    self.cmd_pause(f"CHAN {ch_num}")
+                    self.ctl.cmd_pause(f"CHAN {ch_num}")
                     time.sleep(0.1)
-                    if self.is_closing:
-                        break
-
-                    if not self.is_simulated and self.ser:
-                        self.ser.timeout = 0.5
-                    ans_chan_str = self.query_cmd("CHAN?")
-                    if not self.is_simulated and self.ser:
-                        self.ser.timeout = 1.0
-                    
+                    ans = self.ctl.query_cmd("CHAN?")
                     try:
-                        ans_chan = int(ans_chan_str)
-                    except:
-                        ans_chan = -1
-
-                    if not ans_chan_str or ans_chan != ch_num:
-                        # Empty slot
-                        self.after(0, self.mark_empty, k, "Empty Slot")
+                        ans_i = int(ans)
+                    except Exception:
+                        ans_i = -1
+                    if not ans or ans_i != ch_num:
+                        self._post(self._mark_empty, k, "Empty Slot")
                         continue
-
-                    cards_found += 1
-
-                    # Query Thermocouple signature to detect attached diode
-                    t_val_str = self.query_cmd("TEC:T?")
+                    cards += 1
+                    t_str = self.ctl.query_cmd("TEC:T?")
                     try:
-                        t_val = float(t_val_str)
-                    except:
+                        t_val = float(t_str)
+                    except Exception:
                         t_val = float('nan')
-
-                    # Telemetry Snapshot
-                    i_val_str = self.query_cmd("LAS:LDI?")
+                    i_str = self.ctl.query_cmd("LAS:LDI?")
                     try:
-                        i_val = float(i_val_str)
-                    except:
+                        i_val = float(i_str)
+                    except Exception:
                         i_val = 0.0
-
-                    tec_out_status = 0
-                    las_out_status = 0
                     try:
-                        tec_out_status = int(float(self.query_cmd("TEC:OUT?")))
-                        las_out_status = int(float(self.query_cmd("LAS:OUT?")))
-                    except:
-                        pass
-
-                    if not t_val_str or math.isnan(t_val) or t_val < 0:
-                        # Card exists but diode floating/negative voltage = no laser attached.
-                        # NOTE for future maintainers: this treats ANY sub-zero thermistor
-                        # reading as "no diode present". That is valid for this lab's use case
-                        # (these lasers always operate above 0 °C, so a negative reading only
-                        # ever means a floating/open input), but it is NOT safe for cryogenic
-                        # or sub-zero setups — a genuinely cold diode would be misclassified as
-                        # absent and locked out. Revisit this sentinel if that ever changes.
-                        self.after(0, self.mark_empty, k, "No Laser Attached")
-                    else:
-                        # Valid card found! Query errors
-                        has_hw_err, hw_err_str = self.check_controller_errors_threadsafe(ch_num)
-                        
-                        # Fetch Limits
-                        max_t_str = self.query_cmd("TEC:LIM:THI?")
-                        try:
-                            max_t = float(max_t_str)
-                            if math.isnan(max_t):
-                                max_t = 99.0
-                        except:
-                            max_t = 99.0
-
-                        max_i_str = self.query_cmd("LAS:LIM:I?")
-                        try:
-                            max_i = float(max_i_str)
-                        except:
-                            max_i = float('nan')
-
-                        if math.isnan(max_i):
-                            max_i_str = self.query_cmd("LAS:LIM:LDI?")
-                            try:
-                                max_i = float(max_i_str)
-                            except:
-                                max_i = 500.0
-
-                        if math.isnan(max_i):
-                            max_i = 500.0
-
-                        # Restore modulation with a safety settling delay
-                        self.cmd_pause("LAS:MOD 1")
-
-                        # Dispatch updates to UI thread safely
-                        self.after(0, self.update_channel_after_scan, k, t_val, i_val, tec_out_status, las_out_status, max_t, max_i, has_hw_err, hw_err_str)
+                        tec_out = int(float(self.ctl.query_cmd("TEC:OUT?")))
+                        las_out = int(float(self.ctl.query_cmd("LAS:OUT?")))
+                    except Exception:
+                        tec_out = las_out = 0
+                    if not t_str or math.isnan(t_val) or t_val < 0:
+                        self._post(self._mark_empty, k, "No Laser Attached")
+                        continue
+                    has_err, err = self.ctl.check_controller_errors(ch_num)
+                    try:
+                        max_t = float(self.ctl.query_cmd("TEC:LIM:THI?"))
+                    except Exception:
+                        max_t = 99.0
+                    try:
+                        max_i = float(self.ctl.query_cmd("LAS:LIM:I?"))
+                    except Exception:
+                        max_i = 500.0
+                    self.ctl.cmd_pause("LAS:MOD 1")
+                    self._post(self._update_after_scan, k, t_val, i_val, tec_out, las_out,
+                               max_t, max_i, has_err, err)
                 except Exception as e:
-                    print(f"Error scanning channel {ch_num}: {e}")
-                    self.after(0, self.mark_empty, k, "Empty Slot")
+                    print(f"Scan error ch{ch_num}: {e}")
+                    self._post(self._mark_empty, k, "Empty Slot")
+        self._post(self._finish_scan, cards)
 
-        # Restore default timeout
-        if not self.is_simulated and self.ser:
-            self.ser.timeout = 5.0
-
-        # Run completion callbacks
-        self.after(0, self.finish_channel_scan, cards_found)
-
-    def update_channel_after_scan(self, idx, t_val, i_val, tec_out, las_out, max_t, max_i, has_hw_err, hw_err_str):
-        ch = self.ch_ui[idx]
-        self.ch_populated[idx] = True   # a laser card responded here
-        ch["enable_chk"].configure(state="normal")
-        ch["enable_var"].set(True)
-        ch["laser_label"].configure(state="normal")
-
-        # Update Live boxes
-        set_entry_val(ch["cur_t"], f"{t_val:.1f}")
-        set_entry_val(ch["cur_i"], f"{i_val:.1f}")
-        
-        ch["t_lim"].configure(text=f"{max_t:.0f}")
-        ch["i_lim"].configure(text=f"{max_i:.0f}")
-
-        # Update Command State drop downs to match hardware
-        ch["tec_cmd"].configure(state="normal")
-        ch["las_cmd"].configure(state="normal")
-        ch["tec_cmd"].set("ON" if tec_out == 1 else "OFF")
-        ch["las_cmd"].set("ON" if las_out == 1 else "OFF")
-
-        ch["t_target"].configure(state="normal")
-        ch["i_target"].configure(state="normal")
-        ch["btn_exec"].configure(state="normal")
-
-        # Set live output status boxes visually
-        if tec_out == 1:
-            ch["live_tec"].configure(fg_color="#2e7d32", text_color="white")
-            set_entry_val(ch["live_tec"], "ON")
-        else:
-            ch["live_tec"].configure(fg_color=("#e0e0e0", "#3a3a3a"), text_color=("black", "#888888"))
-            set_entry_val(ch["live_tec"], "OFF")
-
-        if las_out == 1:
-            ch["live_las"].configure(fg_color="#2e7d32", text_color="white")
-            set_entry_val(ch["live_las"], "ON")
-        else:
-            ch["live_las"].configure(fg_color=("#e0e0e0", "#3a3a3a"), text_color=("black", "#888888"))
-            set_entry_val(ch["live_las"], "OFF")
-
-        # Update LED colors and status text
-        if has_hw_err:
-            ch["status"].configure(text=f"FAULT: {hw_err_str}", text_color="#c62828")
-            ch["led"].set_color(theme.led("fault"))
+    def _update_after_scan(self, i, t_val, i_val, tec_out, las_out, max_t, max_i, has_err, err):
+        self.populated[i] = True
+        c = self.cards[i]
+        c.enable.setEnabled(True); c.enable.setChecked(True)
+        c.label.setEnabled(True)
+        for w in (c.tec_cmd, c.las_cmd, c.t_target, c.i_target, c.run):
+            w.setEnabled(True)
+        c.tec_cmd.setCurrentText("ON" if tec_out == 1 else "OFF")
+        c.las_cmd.setCurrentText("ON" if las_out == 1 else "OFF")
+        c.live_t.setText(f"{t_val:.1f}"); c.live_i.setText(f"{i_val:.1f}")
+        c.max_t.setText(f"{max_t:.0f}"); c.max_i.setText(f"{max_i:.0f}")
+        self._on_live_output(i, "TEC", "ON" if tec_out == 1 else "OFF")
+        self._on_live_output(i, "LAS", "ON" if las_out == 1 else "OFF")
+        if has_err:
+            self._on_status(i, f"FAULT: {err}", "fault"); self._on_led(i, "fault")
         elif tec_out == 1 and las_out == 1:
-            ch["status"].configure(text="TEC ON, LAS ON", text_color="#f57c00")
-            ch["led"].set_color(theme.led("ok"))
+            self._on_status(i, "TEC ON, LAS ON", "warn"); self._on_led(i, "ok")
         elif tec_out == 1:
-            ch["status"].configure(text="TEC ON, LAS OFF", text_color="#f57c00")
-            ch["led"].set_color(theme.led("warn"))
+            self._on_status(i, "TEC ON, LAS OFF", "warn"); self._on_led(i, "warn")
         elif las_out == 1:
-            ch["status"].configure(text="WARNING: LAS ON, TEC OFF", text_color="#c62828")
-            ch["led"].set_color(theme.led("fault"))
+            self._on_status(i, "WARNING: LAS ON, TEC OFF", "fault"); self._on_led(i, "fault")
         else:
-            ch["status"].configure(text="Ready", text_color="#2e7d32")
-            ch["led"].set_color(theme.led("ok"))
+            self._on_status(i, "Ready", "ok"); self._on_led(i, "ok")
 
-    def finish_channel_scan(self, cards_found):
+    def _mark_empty(self, i, reason):
+        self.populated[i] = False
+        c = self.cards[i]
+        c.enable.setChecked(False); c.enable.setEnabled(False)
+        c.label.setEnabled(False)
+        for w in (c.tec_cmd, c.las_cmd, c.t_target, c.i_target, c.run):
+            w.setEnabled(False)
+        self._on_live_output(i, "TEC", "OFF"); self._on_live_output(i, "LAS", "OFF")
+        c.live_t.setText("0.0"); c.live_i.setText("0.0")
+        self._on_status(i, reason, "muted"); self._on_led(i, "empty")
+
+    def _finish_scan(self, cards):
         self.is_scanning = False
         if self.is_closing:
-            self.do_cleanup_and_close()
-            return
-
-        if cards_found == 0:
-            self.status_label.configure(text="WARNING: 0 slots responded. Check connection & power.", text_color="#f57c00")
-        else:
-            self.status_label.configure(text="Status: Scan Complete & Matched", text_color="#2e7d32")
-
-        # We now know which slots are populated, so the "unused" filter can apply.
-        self._has_scanned = True
-        self._reflow_cards(force=True)
-
-        self.lock_ui("normal")
-        self.btn_connect.configure(state="normal")
-
-        # Start Telemetry thread if not active
+            self.close(); return
+        self._set_status("Status: Scan Complete & Matched" if cards else
+                         "WARNING: 0 slots responded. Check connection & power.")
+        self.has_scanned = True
+        self._relayout(force=True)
+        self._lock_controls(True)
+        self.btn_scan.setEnabled(True)
+        self.btn_run_all.setEnabled(True)
         if not self.telemetry_active:
             self.telemetry_active = True
-            self.telemetry_thread = threading.Thread(target=self.telemetry_loop, daemon=True)
+            self.telemetry_thread = threading.Thread(target=self._telemetry_loop, daemon=True)
             self.telemetry_thread.start()
 
-    def mark_empty(self, idx, reason):
-        ch = self.ch_ui[idx]
-        self.ch_populated[idx] = False   # empty slot / no laser / disconnected
-        ch["enable_chk"].configure(state="disabled")
-        ch["enable_var"].set(False)
-        ch["laser_label"].configure(state="disabled")
-        
-        ch["live_tec"].configure(fg_color=("#e0e0e0", "#3a3a3a"), text_color=("black", "#888888"))
-        set_entry_val(ch["live_tec"], "OFF")
-        ch["live_las"].configure(fg_color=("#e0e0e0", "#3a3a3a"), text_color=("black", "#888888"))
-        set_entry_val(ch["live_las"], "OFF")
-
-        ch["status"].configure(text=reason, text_color="#78909c")
-        ch["led"].set_color(theme.led("empty"))
-        set_entry_val(ch["cur_t"], "0.0")
-        set_entry_val(ch["cur_i"], "0.0")
-
-        ch["tec_cmd"].configure(state="disabled")
-        ch["las_cmd"].configure(state="disabled")
-        ch["t_target"].configure(state="disabled")
-        ch["i_target"].configure(state="disabled")
-        ch["btn_exec"].configure(state="disabled")
-
-    def lock_ui(self, state):
-        # State: normal or disabled
-        for ch in self.ch_ui:
-            # Skip locked empty slots
-            status_text = ch["status"].cget("text")
-            if status_text in ["Empty Slot", "No Laser Attached", "Disconnected"]:
-                continue
-            ch["btn_exec"].configure(state=state)
-            ch["enable_chk"].configure(state=state)
-            ch["tec_cmd"].configure(state=state)
-            ch["las_cmd"].configure(state=state)
-            ch["t_target"].configure(state=state)
-            ch["i_target"].configure(state=state)
-            ch["laser_label"].configure(state=state)
-
-        self.btn_exec_all.configure(state=state)
-        self.btn_scan.configure(state=state)
-        self.btn_clear_faults.configure(state=state)
-        self.btn_load.configure(state=state)
-        self.btn_save.configure(state=state)
-        self.btn_clear_profile.configure(state=state)
-        self.t_ramp_edit.configure(state=state)
-        self.i_ramp_edit.configure(state=state)
-        self.t_off_edit.configure(state=state)
-
-        # Master buttons
-        self.btn_master_on.configure(state=state)
-        self.btn_master_off.configure(state=state)
-        self.btn_tec_on.configure(state=state)
-        self.btn_tec_off.configure(state=state)
-        self.btn_las_on.configure(state=state)
-        self.btn_las_off.configure(state=state)
-
-    # ----------------------------------------------------
-    # TELEMETRY LOOP BACKGROUND SERVICE
-    # ----------------------------------------------------
-    def telemetry_loop(self):
+    # ------------------------------------------------------------------
+    # Telemetry
+    # ------------------------------------------------------------------
+    def _telemetry_loop(self):
         while self.telemetry_active:
             if not self.is_executing and not self.is_scanning and not self.is_closing:
-                self.run_telemetry_cycle()
+                self._telemetry_cycle()
             time.sleep(2.0)
 
-    def run_telemetry_cycle(self):
-        with self.serial_lock:
-            if not self.ser and not self.is_simulated:
+    def _telemetry_cycle(self):
+        with self.ctl.serial_lock:
+            if not self.ctl.is_connected:
                 return
-
-            old_timeout = 5.0
-            if not self.is_simulated and self.ser:
-                old_timeout = self.ser.timeout
-                self.ser.timeout = 0.2
-
-            any_laser_on = False
-
+            any_on = False
             for k in range(self.num_channels):
-                # Break immediately if state changes during sweep
                 if self.is_executing or self.is_scanning or self.is_closing:
                     break
-
-                ch = self.ch_ui[k]
-                # Only telemetry valid active channels
-                if ch["enable_chk"].cget("state") == "normal":
-                    ch_num = k + 1
+                if not self.populated[k]:
+                    continue
+                ch_num = k + 1
+                try:
+                    self.ctl.cmd_pause(f"CHAN {ch_num}")
+                    t_str = self.ctl.query_cmd("TEC:T?")
+                    i_str = self.ctl.query_cmd("LAS:LDI?")
                     try:
-                        # P0 #4: cmd_pause includes the 0.15s settling delay after CHAN
-                        # switch that MATLAB's cmdPause() provided. Without it the next
-                        # query may return data from the previously selected channel.
-                        self.cmd_pause(f"CHAN {ch_num}")
+                        tec = int(float(self.ctl.query_cmd("TEC:OUT?")))
+                        las = int(float(self.ctl.query_cmd("LAS:OUT?")))
+                    except Exception:
+                        tec = las = None
+                    self._post(self._telemetry_update, k, t_str, i_str, tec, las)
+                    if las == 1:
+                        any_on = True
+                    self.telemetry_fail_count = 0
+                except Exception as e:
+                    print(f"Telemetry fail ch{ch_num}: {e}")
+                    self.telemetry_fail_count += 1
+                    if self.telemetry_fail_count > 3:
+                        self.telemetry_active = False
+                        self._post(self._handle_connection_loss)
+                        break
+            self._post(self.btn_emo.setEnabled, any_on)
 
-                        t_val_str = self.query_cmd("TEC:T?")
-                        try:
-                            t_val = float(t_val_str)
-                            if math.isnan(t_val):
-                                t_val = None
-                        except:
-                            t_val = None
-
-                        i_val_str = self.query_cmd("LAS:LDI?")
-                        try:
-                            i_val = float(i_val_str)
-                            if math.isnan(i_val):
-                                i_val = None
-                        except:
-                            i_val = None
-
-                        tec_stat = None
-                        las_stat = None
-                        try:
-                            tec_stat = int(float(self.query_cmd("TEC:OUT?")))
-                            las_stat = int(float(self.query_cmd("LAS:OUT?")))
-                        except:
-                            pass
-
-                        # Dispatch updates safely
-                        self.after(0, self.update_telemetry_widgets, k, t_val, i_val, tec_stat, las_stat)
-                        
-                        if las_stat == 1:
-                            any_laser_on = True
-
-                        self.telemetry_fail_count = 0  # Reset on success
-
-                    except Exception as e:
-                        print(f"Background telemetry failed on channel {ch_num}: {e}")
-                        self.telemetry_fail_count += 1
-                        if self.telemetry_fail_count > 3:
-                            self.telemetry_active = False
-                            self.after(0, self.handle_telemetry_connection_loss)
-                            break
-
-            # Update EMO button status
-            if any_laser_on:
-                self.after(0, lambda: self.btn_emerg.configure(state="normal"))
-            else:
-                self.after(0, lambda: self.btn_emerg.configure(state="disabled"))
-
-            if not self.is_simulated and self.ser:
-                self.ser.timeout = old_timeout
-
-    def update_telemetry_widgets(self, idx, t_val, i_val, tec_stat, las_stat):
+    def _telemetry_update(self, i, t_str, i_str, tec, las):
         try:
-            if self.is_closing:
-                return
-            ch = self.ch_ui[idx]
-            if t_val is not None:
-                set_entry_val(ch["cur_t"], f"{t_val:.1f}")
-            if i_val is not None:
-                set_entry_val(ch["cur_i"], f"{i_val:.1f}")
-
-            if tec_stat is not None:
-                if tec_stat == 1:
-                    ch["live_tec"].configure(fg_color="#2e7d32", text_color="white")
-                    set_entry_val(ch["live_tec"], "ON")
-                else:
-                    ch["live_tec"].configure(fg_color=("#e0e0e0", "#3a3a3a"), text_color=("black", "#888888"))
-                    set_entry_val(ch["live_tec"], "OFF")
-
-            if las_stat is not None:
-                if las_stat == 1:
-                    ch["live_las"].configure(fg_color="#2e7d32", text_color="white")
-                    set_entry_val(ch["live_las"], "ON")
-                else:
-                    ch["live_las"].configure(fg_color=("#e0e0e0", "#3a3a3a"), text_color=("black", "#888888"))
-                    set_entry_val(ch["live_las"], "OFF")
-        except tk.TclError:
+            self.cards[i].live_t.setText(f"{float(t_str):.1f}")
+        except Exception:
             pass
-
-    def handle_telemetry_connection_loss(self):
-        self.status_label.configure(text="Status: Connection Lost", text_color="#c62828")
-        self.lock_ui("disabled")
-        self.btn_connect.configure(text="Connect", fg_color="#1976D2")
-        self.ser = None
-        messagebox.showerror("Connection Lost", "Hardware communication lost. Execution halted. Lasers not explicitly shut off.")
-        self.is_stop_requested = True
-
-    # ----------------------------------------------------
-    # MASTER DROPDOWN / OVERRIDE FUNCTIONS
-    # ----------------------------------------------------
-    def set_all_dropdowns(self, type_str, state_str):
-        for ch in self.ch_ui:
-            if type_str == "TEC" and ch["tec_cmd"].cget("state") == "normal":
-                ch["tec_cmd"].set(state_str)
-            elif type_str == "LAS" and ch["las_cmd"].cget("state") == "normal":
-                ch["las_cmd"].set(state_str)
-        self.mark_profile_unsaved()
-
-    def set_all_systems(self, state_str):
-        for ch in self.ch_ui:
-            if ch["tec_cmd"].cget("state") == "normal":
-                ch["tec_cmd"].set(state_str)
-            if ch["las_cmd"].cget("state") == "normal":
-                ch["las_cmd"].set(state_str)
-        self.mark_profile_unsaved()
-
-    # ----------------------------------------------------
-    # SAFETY SHUTOFFS (EMO & STOP BUTTONS)
-    # ----------------------------------------------------
-    def stop_execution(self):
-        if self.is_executing:
-            self.is_stop_requested = True
-            self.status_label.configure(text="Status: STOP COMMANDED. Halting safely...", text_color="#c62828")
-            # P3 #9: Triple bell matches MATLAB triple-beep auditory alert in lab environments
-            self.bell()
-            self.after(150, self.bell)
-            self.after(300, self.bell)
-
-    def emergency_las_off(self):
-        self.btn_emerg.configure(state="disabled")
-        msg = "WARNING: Immediately cutting current without ramping down can damage the laser diode. Are you sure you want to proceed?"
-        if not messagebox.askyesno("Emergency LAS OFF", msg):
-            self.btn_emerg.configure(state="normal")
-            return
-
-        # Break any in-progress ramp immediately so the laser stops advancing.
-        self.is_stop_requested = True
-        self.is_emo_requested = True
-
-        if self.is_executing:
-            # A sequence is running and owns the serial lock for the entire duration
-            # of each channel's ramp. Spawning a competing EMO thread here would just
-            # block on that lock until the whole ramp finished (the previous bug: EMO
-            # could not fire during the most dangerous moment of a run). Instead we
-            # flag it: setting is_stop_requested aborts the ramp within a fraction of
-            # a second (via safe_pause), and run_sequence_thread's cleanup performs
-            # the laser cutoff itself once the serial lock is free.
-            self.status_label.configure(text="Status: EMERGENCY OFF — cutting laser...", text_color="#ff0000")
-            return
-
-        # Idle (laser holding but not ramping): the serial lock is free, so cut now.
-        # P1 #6: EMO thread must NOT be a daemon — laser-off commands must complete
-        # even if the main thread is exiting. Track it for join-on-close.
-        self._emo_thread = threading.Thread(target=self._perform_emergency_shutdown, daemon=False)
-        self._emo_thread.start()
-
-    def _perform_emergency_shutdown(self):
-        """Cut LAS output on every active channel. Caller must ensure the serial
-        lock is free (either idle, or the sequence thread has released it)."""
-        with self.serial_lock:
-            for k in range(self.num_channels):
-                # P2 #7: Abort gracefully if app is closing (Removed: EMO must complete)
-                ch = self.ch_ui[k]
-                if ch["enable_chk"].cget("state") == "normal":
-                    ch_num = k + 1
-                    try:
-                        self.send_cmd(f"CHAN {ch_num}")
-                        time.sleep(0.15)
-                        self.send_cmd("LAS:OUTPUT 0")
-
-                        # Update UI
-                        self.after(0, self.update_channel_emergency_off, k)
-                    except:
-                        pass
-
-            self.after(0, self.finish_emergency_las_off)
-
-    def update_channel_emergency_off(self, idx):
-        ch = self.ch_ui[idx]
-        ch["live_las"].configure(fg_color=("#e0e0e0", "#3a3a3a"), text_color=("black", "#888888"))
-        set_entry_val(ch["live_las"], "OFF")
-        ch["status"].configure(text="EMERGENCY OFF: Current Cut", text_color="#c62828")
-        ch["led"].set_color(theme.led("fault"))
-
-    def finish_emergency_las_off(self):
-        self.status_label.configure(text="Status: EMERGENCY LASER SHUTDOWN TRIGGERED.", text_color="#ff0000")
-        self.is_stop_requested = True
-        self.btn_emerg.configure(state="normal")
-
-    def clear_faults(self):
-        self.lock_ui("disabled")
-        self.status_label.configure(text="Status: Clearing chassis faults...", text_color="#f57c00")
-        threading.Thread(target=self.run_clear_faults, daemon=True).start()
-
-    def run_clear_faults(self):
-        with self.serial_lock:
-            for k in range(self.num_channels):
-                if self.is_closing:
-                    break
-                ch = self.ch_ui[k]
-                if ch["enable_chk"].cget("state") == "normal":
-                    ch_num = k + 1
-                    try:
-                        self.send_cmd(f"CHAN {ch_num}")
-                        time.sleep(0.1)
-                        self.send_cmd("*CLS")
-                        time.sleep(0.1)
-                    except:
-                        pass
-
-        # P1 #8: Set is_scanning flag so the telemetry loop won't collide
-        # with the subsequent re-scan on the serial port.
-        self.is_scanning = True
-        # Trigger a scan again to refresh hardware status
-        self.run_channel_scan()
-
-    # ----------------------------------------------------
-    # PROCEDURE EXECUTION LOOP (RUN ALL & RUN CH)
-    # ----------------------------------------------------
-    def execute_single_channel(self, ch_num):
-        self.execute_channels([ch_num])
-
-    def execute_all(self):
-        active_channels = []
-        for idx, ch in enumerate(self.ch_ui):
-            if ch["enable_chk"].cget("state") == "normal" and ch["enable_var"].get():
-                active_channels.append(idx + 1)
-
-        if not active_channels:
-            messagebox.showwarning("Warning", "No channels are marked \"Enable\" for the sequence!")
-            return
-        
-        self.execute_channels(active_channels)
-
-    def execute_channels(self, channels_to_run):
-        if self.is_executing:
-            return
-
-        # Read global ramp configuration inputs
         try:
-            t_ramp = float(self.t_ramp_edit.get())
-            i_ramp = float(self.i_ramp_edit.get())
-            t_off_target = float(self.t_off_edit.get())
+            self.cards[i].live_i.setText(f"{float(i_str):.1f}")
+        except Exception:
+            pass
+        if tec is not None:
+            self._on_live_output(i, "TEC", "ON" if tec == 1 else "OFF")
+        if las is not None:
+            self._on_live_output(i, "LAS", "ON" if las == 1 else "OFF")
+
+    def _handle_connection_loss(self):
+        self._set_status("Status: Connection Lost")
+        self._lock_controls(False)
+        self.btn_connect.setText("Connect")
+        self.ctl.ser = None
+        self.ctl.is_stop_requested = True
+        QMessageBox.critical(self, "Connection Lost",
+                             "Hardware communication lost. Execution halted. Lasers not explicitly shut off.")
+
+    # ------------------------------------------------------------------
+    # Master overrides
+    # ------------------------------------------------------------------
+    def set_all_dropdowns(self, kind, state):
+        for c in self.cards:
+            w = c.tec_cmd if kind == "TEC" else c.las_cmd
+            if w.isEnabled():
+                w.setCurrentText(state)
+
+    def set_all_systems(self, state):
+        for c in self.cards:
+            if c.tec_cmd.isEnabled():
+                c.tec_cmd.setCurrentText(state)
+            if c.las_cmd.isEnabled():
+                c.las_cmd.setCurrentText(state)
+
+    # ------------------------------------------------------------------
+    # Sequence execution
+    # ------------------------------------------------------------------
+    def execute_all(self):
+        chans = [i + 1 for i in range(self.num_channels)
+                 if self.cards[i].enable.isChecked() and self.cards[i].enable.isEnabled()]
+        if not chans:
+            QMessageBox.warning(self, "Warning", 'No channels are marked "On" for the sequence!')
+            return
+        self.execute_channels(chans)
+
+    def execute_channels(self, chans):
+        if self.is_executing:
+            return
+        try:
+            t_ramp = float(self.t_ramp.text()); i_ramp = float(self.i_ramp.text()); t_off = float(self.t_off.text())
         except ValueError:
-            messagebox.showerror("Invalid Configuration", "Ramping speeds and off target must be valid numbers.")
+            QMessageBox.critical(self, "Invalid Configuration", "Ramp speeds and off target must be numbers.")
+            return
+        if t_ramp <= 0 or i_ramp <= 0:
+            QMessageBox.critical(self, "Invalid Configuration", "Ramp speeds must be > 0.")
             return
 
-        if t_ramp <= 0.0 or i_ramp <= 0.0:
-            messagebox.showerror("Invalid Configuration", "Ramp speeds must be strictly greater than 0 to prevent hardware damage and infinite loops.")
-            return
-
-        # Build the channel plans and ETA on the MAIN thread. All widget reads must
-        # happen here — the worker thread (and the sequence engine) must never touch
-        # Tk widgets. The engine reports back only through the _TkSequenceEvents
-        # adapter, which marshals every update via after().
-        plans, total_est = self._build_sequence(channels_to_run, t_ramp, i_ramp, t_off_target)
-
-        # Prepare state variables
-        self.is_executing = True
-        self.is_stop_requested = False
-        self.is_emo_requested = False
-        self.status_label.configure(text="Status: Sequence Running...", text_color="#2e7d32")
-
-        self.lock_ui("disabled")
-        self.btn_stop.configure(state="normal")
-        self.btn_emerg.configure(state="normal")
-
-        # Start sequence thread
-        threading.Thread(target=self.run_sequence_thread,
-                         args=(plans, t_ramp, i_ramp, t_off_target, total_est),
-                         daemon=True).start()
-
-    def _build_sequence(self, channels_to_run, t_ramp, i_ramp, t_off_target):
-        """Read the per-channel widgets (MAIN THREAD ONLY) and produce the channel
-        plans plus the estimated total run time (ETA). Kept off the worker thread so
-        the sequence engine never touches Tk widgets."""
-        TEC_ON_TIME = 1.0
-        LAS_ON_TIME = 4.0
-        LAS_OFF_TIME = 1.5
-        TEC_OFF_TIME = 1.0
-
-        total_est = 0.0
         plans = []
-        for ch_num in channels_to_run:
-            ch = self.ch_ui[ch_num - 1]
-
-            t_cmd = ch["tec_cmd"].get()
-            l_cmd = ch["las_cmd"].get()
-            live_t = ch["live_tec"].get()
-            live_l = ch["live_las"].get()
-
-            # Targets are user input and decide whether the channel can run.
+        for ch_num in chans:
+            c = self.cards[ch_num - 1]
             try:
-                t_targ = float(ch["t_target"].get())
-                i_targ = float(ch["i_target"].get())
-                targets_valid = True
+                tt = float(c.t_target.text()); ti = float(c.i_target.text()); valid = True
             except ValueError:
-                t_targ, i_targ, targets_valid = 0.0, 0.0, False
+                tt, ti, valid = 0.0, 0.0, False
+            plans.append(ChannelPlan(idx=ch_num - 1, ch_num=ch_num,
+                                     tec_cmd=c.tec_cmd.currentText(), las_cmd=c.las_cmd.currentText(),
+                                     t_target=tt, i_target=ti, targets_valid=valid))
 
-            # ETA snapshot (matches MATLAB: any unparseable field -> all defaults).
+        self.total_estimated_time = self._estimate_time(plans, t_ramp, i_ramp, t_off)
+        self.is_executing = True
+        self.ctl.is_stop_requested = False
+        self.ctl.is_emo_requested = False
+        self._set_status("Status: Sequence Running...")
+        self._lock_controls(False)
+        self.btn_stop.setEnabled(True)
+        self.btn_emo.setEnabled(True)
+        threading.Thread(target=self._run_sequence, args=(plans, t_ramp, i_ramp, t_off), daemon=True).start()
+
+    def _estimate_time(self, plans, t_ramp, i_ramp, t_off):
+        TEC_ON, LAS_ON, LAS_OFF, TEC_OFF = 1.0, 4.0, 1.5, 1.0
+        total = 0.0
+        for p in plans:
+            c = self.cards[p.idx]
             try:
-                curr_t = float(ch["cur_t"].get())
-                curr_i = float(ch["cur_i"].get())
-                eta_t = float(ch["t_target"].get())
-                eta_i = float(ch["i_target"].get())
-            except ValueError:
-                curr_t, curr_i, eta_t, eta_i = 22.0, 0.0, 22.0, 0.0
+                ct = float(c.live_t.text()); ci = float(c.live_i.text())
+            except Exception:
+                ct, ci = 22.0, 0.0
+            lt, ll = c.live_tec.text(), c.live_las.text()
+            tc, lc = p.tec_cmd, p.las_cmd
+            if lt == "OFF" and ll == "OFF":
+                if tc == "ON" and lc == "OFF":
+                    total += TEC_ON + abs(p.t_target - ct) / t_ramp
+                elif tc == "ON" and lc == "ON":
+                    total += TEC_ON + abs(p.t_target - ct) / t_ramp + LAS_ON + abs(p.i_target) / i_ramp
+            elif lt == "ON" and ll == "OFF":
+                if tc == "ON" and lc == "ON":
+                    total += abs(p.t_target - ct) / t_ramp + LAS_ON + abs(p.i_target) / i_ramp
+                elif tc == "OFF" and lc == "OFF":
+                    total += abs(t_off - ct) / t_ramp + TEC_OFF
+                elif tc == "ON" and lc == "OFF":
+                    total += abs(p.t_target - ct) / t_ramp
+            elif lt == "ON" and ll == "ON":
+                if tc == "ON" and lc == "OFF":
+                    total += abs(ci) / i_ramp + LAS_OFF + abs(p.t_target - ct) / t_ramp
+                elif tc == "OFF" and lc == "OFF":
+                    total += abs(ci) / i_ramp + LAS_OFF + abs(t_off - ct) / t_ramp + TEC_OFF
+                elif tc == "ON" and lc == "ON":
+                    total += abs(p.t_target - ct) / t_ramp + abs(p.i_target - ci) / i_ramp
+        return total
 
-            if live_t == "OFF" and live_l == "OFF":
-                if t_cmd == "ON" and l_cmd == "OFF":
-                    total_est += TEC_ON_TIME + abs(eta_t - curr_t) / t_ramp
-                elif t_cmd == "ON" and l_cmd == "ON":
-                    total_est += TEC_ON_TIME + abs(eta_t - curr_t) / t_ramp
-                    total_est += LAS_ON_TIME + abs(eta_i - 0.0) / i_ramp
-            elif live_t == "ON" and live_l == "OFF":
-                if t_cmd == "ON" and l_cmd == "ON":
-                    total_est += abs(eta_t - curr_t) / t_ramp
-                    total_est += LAS_ON_TIME + abs(eta_i - 0.0) / i_ramp
-                elif t_cmd == "OFF" and l_cmd == "OFF":
-                    total_est += abs(t_off_target - curr_t) / t_ramp + TEC_OFF_TIME
-                elif t_cmd == "ON" and l_cmd == "OFF":
-                    total_est += abs(eta_t - curr_t) / t_ramp
-            elif live_t == "ON" and live_l == "ON":
-                if t_cmd == "ON" and l_cmd == "OFF":
-                    total_est += abs(0.0 - curr_i) / i_ramp + LAS_OFF_TIME
-                    total_est += abs(eta_t - curr_t) / t_ramp
-                elif t_cmd == "OFF" and l_cmd == "OFF":
-                    total_est += abs(0.0 - curr_i) / i_ramp + LAS_OFF_TIME
-                    total_est += abs(t_off_target - curr_t) / t_ramp + TEC_OFF_TIME
-                elif t_cmd == "ON" and l_cmd == "ON":
-                    total_est += abs(eta_t - curr_t) / t_ramp
-                    total_est += abs(eta_i - curr_i) / i_ramp
-
-            plans.append(ChannelPlan(
-                idx=ch_num - 1, ch_num=ch_num,
-                tec_cmd=t_cmd, las_cmd=l_cmd,
-                t_target=t_targ, i_target=i_targ,
-                targets_valid=targets_valid))
-
-        return plans, total_est
-
-    def run_sequence_thread(self, plans, t_ramp, i_ramp, t_off_target, total_estimated_time):
-        # Plans and ETA were prepared on the main thread (see _build_sequence).
-        # This worker only drives the UI-agnostic sequence engine, which does all
-        # hardware I/O, the safety state machine, and the ramps.
-        self.total_estimated_time = total_estimated_time
+    def _run_sequence(self, plans, t_ramp, i_ramp, t_off):
         self.sequence_start_time = time.time()
+        self.seq.run(plans, t_ramp, i_ramp, t_off)
+        self._post(self._finish_sequence, len(plans))
 
-        self.seq.run(plans, t_ramp, i_ramp, t_off_target)
-
-        # Finished Phase Cleanup
+    def _finish_sequence(self, n):
         self.is_executing = False
-        self.after(0, self.lock_ui, "normal")
-        self.after(0, lambda: self.btn_stop.configure(state="disabled"))
-
-        if self.is_emo_requested:
-            # EMO was requested mid-run: the ramp has aborted and we've now left the
-            # serial-lock block, so the lock is free. Cut every active laser here in
-            # the sequence thread (finish_emergency_las_off sets the final status).
+        self._lock_controls(True)
+        self.btn_stop.setEnabled(False)
+        if self.ctl.is_emo_requested:
             self._perform_emergency_shutdown()
-            self.is_emo_requested = False
-        elif self.is_stop_requested:
-            self.after(0, lambda: self.status_label.configure(text="Status: Hardware Halted & Pinned.", text_color="#c62828"))
+            self.ctl.is_emo_requested = False
+        elif self.ctl.is_stop_requested:
+            self._set_status("Status: Hardware Halted & Pinned.")
         else:
-            self.after(0, lambda: self.status_label.configure(text="Status: Sequence Complete & Settled.", text_color="#2e7d32"))
-            if len(plans) > 1:
-                self.bell()
-                self.after(0, lambda: messagebox.showinfo("Done", "Sequence completed across all selected channels."))
-
-        # Trigger telemetry immediately to synchronize button state
-        self.run_telemetry_cycle()
-
-    # --- Sequence event handlers (invoked on the Tk thread via _TkSequenceEvents) ---
-    def _handle_channel_halted(self, idx):
-        """UI response to a cooperative STOP / EMO halt on channel idx."""
-        ch = self.ch_ui[idx]
-        if ch["status"].cget("text") == "Initializing...":
-            self.update_channel_status(idx, "HALTED (Before Ramp)", theme.status("fault"))
-        else:
-            self.update_channel_status(
-                idx, f"HALTED at {ch['cur_t'].get()}°C, {ch['cur_i'].get()}mA", theme.status("fault"))
-        self._triple_bell()
-
-    def _handle_channel_fault(self, idx, message):
-        """UI response to a hardware / validation fault on channel idx."""
-        self.update_channel_status(idx, message, theme.status("fault"))
-        self.ch_ui[idx]["led"].set_color(theme.led("fault"))
-        print(f"[Hardware Fault] Channel {idx + 1}: {message}")
-        self._triple_bell()
-
-    def _triple_bell(self):
-        # P3 #9: Triple bell matches MATLAB triple-beep for fault/halt alerts.
-        self.bell()
-        self.after(150, self.bell)
-        self.after(300, self.bell)
-
-    # --- UI Dispatch Update Helpers ---
-    def update_channel_status(self, idx, text, color):
-        self.ch_ui[idx]["status"].configure(text=text, text_color=color)
-
-    def update_live_out_ui(self, idx, type_str, state_str):
-        ch = self.ch_ui[idx]
-        if type_str == "TEC":
-            if state_str == "ON":
-                ch["live_tec"].configure(fg_color="#2e7d32", text_color="white")
-                set_entry_val(ch["live_tec"], "ON")
-            else:
-                ch["live_tec"].configure(fg_color=("#e0e0e0", "#3a3a3a"), text_color=("black", "#888888"))
-                set_entry_val(ch["live_tec"], "OFF")
-        elif type_str == "LAS":
-            if state_str == "ON":
-                ch["live_las"].configure(fg_color="#2e7d32", text_color="white")
-                set_entry_val(ch["live_las"], "ON")
-            else:
-                ch["live_las"].configure(fg_color=("#e0e0e0", "#3a3a3a"), text_color=("black", "#888888"))
-                set_entry_val(ch["live_las"], "OFF")
+            self._set_status("Status: Sequence Complete & Settled.")
+            if n > 1:
+                QMessageBox.information(self, "Done", "Sequence completed across all selected channels.")
+        threading.Thread(target=self._telemetry_cycle, daemon=True).start()
 
     def update_eta(self):
         if not self.sequence_start_time:
             return
-        elapsed = time.time() - self.sequence_start_time
-        rem = max(0.0, self.total_estimated_time - elapsed)
-        
-        mins = int(rem // 60)
-        secs = int(rem % 60)
-
-        if rem > 0.0:
-            self.after(0, lambda: self.status_label.configure(
-                text=f"Status: Sequence Running... (Time Remaining: {mins:02d}:{secs:02d})", text_color="#2e7d32"))
+        rem = max(0.0, self.total_estimated_time - (time.time() - self.sequence_start_time))
+        if rem > 0:
+            self._set_status(f"Status: Sequence Running... (Time Remaining: {int(rem // 60):02d}:{int(rem % 60):02d})")
         else:
-            self.after(0, lambda: self.status_label.configure(
-                text="Status: Sequence Running... (Finishing up)", text_color="#2e7d32"))
+            self._set_status("Status: Sequence Running... (Finishing up)")
 
-    # ----------------------------------------------------
-    # APPLICATION CLEANUP & SHUTDOWN
-    # ----------------------------------------------------
-    def close_app(self):
+    # ------------------------------------------------------------------
+    # Safety shutoffs
+    # ------------------------------------------------------------------
+    def stop_execution(self):
         if self.is_executing:
-            selection = messagebox.askyesnocancel("Action Required", 
-                "A hardware sequence is currently running. You must safely halt the hardware before closing.\n\nWould you like to STOP execution now?")
-            if selection:  # Yes -> Stop and delay closing
+            self.ctl.is_stop_requested = True
+            self._set_status("Status: STOP COMMANDED. Halting safely...")
+            self._triple_bell()
+
+    def emergency_las_off(self):
+        if QMessageBox.question(self, "Emergency LAS OFF",
+                                "Immediately cutting current without ramping can damage the diode. Proceed?") \
+                != QMessageBox.Yes:
+            return
+        self.ctl.is_stop_requested = True
+        self.ctl.is_emo_requested = True
+        if self.is_executing:
+            self._set_status("Status: EMERGENCY OFF — cutting laser...")
+            return
+        self._emo_thread = threading.Thread(target=self._perform_emergency_shutdown, daemon=False)
+        self._emo_thread.start()
+
+    def _perform_emergency_shutdown(self):
+        with self.ctl.serial_lock:
+            for k in range(self.num_channels):
+                if not self.populated[k]:
+                    continue
+                try:
+                    self.ctl.send_cmd(f"CHAN {k + 1}")
+                    time.sleep(0.15)
+                    self.ctl.send_cmd("LAS:OUTPUT 0")
+                    self._post(self._on_status, k, "EMERGENCY OFF: Current Cut", "fault")
+                    self._post(self._on_led, k, "fault")
+                except Exception:
+                    pass
+        self._post(self._set_status, "Status: EMERGENCY LASER SHUTDOWN TRIGGERED.")
+
+    def clear_faults(self):
+        self._set_status("Status: Clearing chassis faults...")
+
+        def run():
+            with self.ctl.serial_lock:
+                for k in range(self.num_channels):
+                    if not self.populated[k]:
+                        continue
+                    try:
+                        self.ctl.send_cmd(f"CHAN {k + 1}"); time.sleep(0.1)
+                        self.ctl.send_cmd("*CLS"); time.sleep(0.1)
+                    except Exception:
+                        pass
+            self.is_scanning = True
+            self._run_scan()
+        threading.Thread(target=run, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Locking, theme, profiles
+    # ------------------------------------------------------------------
+    def _lock_controls(self, enabled):
+        for i in range(self.num_channels):
+            if not self.populated[i]:
+                continue
+            c = self.cards[i]
+            for w in (c.enable, c.label, c.tec_cmd, c.las_cmd, c.t_target, c.i_target, c.run):
+                w.setEnabled(enabled)
+        for b in self._master_buttons:
+            b.setEnabled(enabled)
+        self.btn_run_all.setEnabled(enabled)
+        self.btn_scan.setEnabled(enabled)
+        for w in (self.t_ramp, self.i_ramp, self.t_off, self.btn_save, self.btn_load, self.btn_clear_prof):
+            w.setEnabled(enabled)
+
+    def _on_os_theme_changed(self, scheme):
+        self.dark = (scheme == Qt.ColorScheme.Dark)
+        self._apply_theme()
+
+    def _apply_theme(self):
+        app = QApplication.instance()
+        app.setPalette(make_palette(self.dark))
+        app.setStyleSheet(build_stylesheet(self.dark))
+        self._style_combo_popups()
+        # Re-apply dynamic per-widget colors that the stylesheet doesn't cover.
+        for i in range(self.num_channels):
+            self._on_live_output(i, "TEC", self.cards[i].live_tec.text())
+            self._on_live_output(i, "LAS", self.cards[i].live_las.text())
+
+    def _style_combo_popups(self):
+        """Style each combo's popup list view directly. A global QSS descendant
+        selector does not reliably reach the popup (a separate top-level), which
+        left hovered items as unreadable white-on-white; setting the view's own
+        stylesheet fixes it."""
+        field_bg = "#33373c" if self.dark else "#ffffff"
+        text = "#e6e6e6" if self.dark else "#1a1a1a"
+        qss = (f"QAbstractItemView {{ background: {field_bg}; color: {text}; outline: 0; }}"
+               f"QAbstractItemView::item {{ color: {text}; padding: 3px 6px; min-height: 20px; }}"
+               f"QAbstractItemView::item:hover {{ background: #1976D2; color: #ffffff; }}"
+               f"QAbstractItemView::item:selected {{ background: #1976D2; color: #ffffff; }}")
+        # Also fix the palette so the highlight is blue-on-white even if the style
+        # draws the hovered item via palette roles rather than the stylesheet.
+        pal = QPalette()
+        pal.setColor(QPalette.Base, QColor(field_bg))
+        pal.setColor(QPalette.Text, QColor(text))
+        pal.setColor(QPalette.Highlight, QColor("#1976D2"))
+        pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+        combos = [self.com_combo]
+        for c in getattr(self, "cards", []):
+            combos += [c.tec_cmd, c.las_cmd]
+        for combo in combos:
+            view = combo.view()
+            view.setStyleSheet(qss)
+            view.setPalette(pal)
+
+    def _mark_unsaved(self, *_):
+        if not self._unsaved:
+            self._unsaved = True
+            t = self.lbl_profile.text()
+            if not t.startswith("* "):
+                self.lbl_profile.setText("* " + t)
+                self.lbl_profile.setStyleSheet("color:#f57c00;")
+
+    def _set_profile_label(self, text):
+        self._unsaved = False
+        self.lbl_profile.setText(text)
+        self.lbl_profile.setStyleSheet("")
+
+    def save_profile(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Profile", "", "Text files (*.txt)")
+        if not path:
+            return
+        try:
+            data = {"COM_Port": self.com_combo.currentText(),
+                    "T_ramp": float(self.t_ramp.text()), "I_ramp": float(self.i_ramp.text()),
+                    "T_OFF_Target": float(self.t_off.text()), "channels": []}
+            for c in self.cards:
+                data["channels"].append({"T_Target": float(c.t_target.text() or 0),
+                                         "I_Target": float(c.i_target.text() or 0),
+                                         "Label": c.label.text()})
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+            self.active_profile_path = path
+            self._save_pref(path)
+            self._set_profile_label(f"Active Profile: {os.path.basename(path)}")
+            QMessageBox.information(self, "Profile Saved", "Configuration profile saved.")
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"Failed to save profile:\n{e}")
+
+    def load_profile(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Profile", "", "Text files (*.txt)")
+        if path:
+            self._load_profile_file(path, announce=True)
+
+    def _load_profile_file(self, path, announce=False):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self.t_ramp.setText(str(data["T_ramp"]))
+            self.i_ramp.setText(str(data["I_ramp"]))
+            self.t_off.setText(str(data["T_OFF_Target"]))
+            for k, cfg in enumerate(data["channels"][:self.num_channels]):
+                self.cards[k].t_target.setText(str(cfg["T_Target"]))
+                self.cards[k].i_target.setText(str(cfg["I_Target"]))
+                self.cards[k].label.setText(cfg.get("Label", f"Laser {k + 1}"))
+            self.active_profile_path = path
+            self._save_pref(path)
+            self._set_profile_label(f"Active Profile: {os.path.basename(path)}")
+            if announce:
+                QMessageBox.information(self, "Profile Loaded",
+                                       f'Profile "{os.path.basename(path)}" loaded.')
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", f"Failed to load profile:\n{e}")
+
+    def clear_profile(self):
+        if QMessageBox.question(self, "Confirm Clear",
+                                "Clear the active profile and reset all settings to defaults?") != QMessageBox.Yes:
+            return
+        self.t_ramp.setText("0.1"); self.i_ramp.setText("0.5"); self.t_off.setText("22.0")
+        for k, c in enumerate(self.cards):
+            c.t_target.setText("22.0"); c.i_target.setText("0.0"); c.label.setText(f"Laser {k + 1}")
+        try:
+            if os.path.exists(PREF_FILE):
+                os.remove(PREF_FILE)
+        except Exception:
+            pass
+        self.active_profile_path = ""
+        self._set_profile_label("Active Profile: [Default/Cleared]")
+
+    def _save_pref(self, path):
+        try:
+            with open(PREF_FILE, "w") as f:
+                json.dump({"LastProfilePath": path}, f)
+        except Exception as e:
+            print(f"Error saving preferences: {e}")
+
+    def _load_last_profile(self):
+        if os.path.exists(PREF_FILE):
+            try:
+                with open(PREF_FILE) as f:
+                    last = json.load(f).get("LastProfilePath", "")
+                if last and os.path.isfile(last):
+                    self._load_profile_file(last)
+            except Exception as e:
+                print(f"Error loading preferences: {e}")
+
+    # ------------------------------------------------------------------
+    def closeEvent(self, event):
+        if self.is_executing:
+            if QMessageBox.question(self, "Sequence Running",
+                                    "A sequence is running. Stop it now?") == QMessageBox.Yes:
                 self.stop_execution()
+            event.ignore()
             return
-
-        if self.is_scanning:
-            self.is_closing = True
-            self.status_label.configure(text="Status: Aborting scan to close...", text_color="#f57c00")
-            return
-
-        # Check unsaved profile
-        text = self.lbl_profile.cget("text")
-        if text.startswith("* "):
-            selection = messagebox.askyesnocancel("Unsaved Changes", 
-                "You have unsaved changes to the active profile. Do you want to save them before exiting?")
-            if selection is True:  # Save
-                self.save_config()
-                # Verify if save was completed or cancelled
-                if self.lbl_profile.cget("text").startswith("* "):
-                    return
-            elif selection is None:  # Cancel close
-                return
-
-        self.do_cleanup_and_close()
-
-    def do_cleanup_and_close(self):
+        if self._unsaved:
+            resp = QMessageBox.question(self, "Unsaved Changes",
+                                        "You have unsaved profile changes. Save before exiting?",
+                                        QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+            if resp == QMessageBox.Cancel:
+                event.ignore(); return
+            if resp == QMessageBox.Yes:
+                self.save_profile()
+                if self._unsaved:  # save cancelled
+                    event.ignore(); return
         self.is_closing = True
         self.telemetry_active = False
-
-        # Join telemetry thread
         if self.telemetry_thread and self.telemetry_thread.is_alive():
             self.telemetry_thread.join(timeout=1.0)
-
-        # P1 #6: Join EMO thread — it's non-daemon so laser-off commands must complete
-        emo_thread = getattr(self, "_emo_thread", None)
-        if emo_thread and emo_thread.is_alive():
-            emo_thread.join(timeout=3.0)
-
-        # Close serial port
-        with self.serial_lock:
-            if self.ser:
-                try:
-                    self.ser.close()
-                except:
-                    pass
-                self.ser = None
-
-        self.destroy()
-        sys.exit(0)
+        if self._emo_thread and self._emo_thread.is_alive():
+            self._emo_thread.join(timeout=3.0)
+        self.ctl.close()
+        event.accept()
 
 
-# --- Generic Helper for CTkEntry Value Manipulation ---
-def set_entry_val(entry, value):
-    state = entry.cget("state")
-    entry.configure(state="normal")
-    entry.delete(0, tk.END)
-    entry.insert(0, str(value))
-    entry.configure(state=state)
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = LDCMainWindow()
+    win.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    app = LDCControllerApp()
-    app.mainloop()
+    main()
