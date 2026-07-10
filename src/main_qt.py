@@ -99,13 +99,26 @@ def build_stylesheet(dark):
     QLabel#reading {{ font-size: 16px; }}
     QLineEdit, QComboBox {{
         background: {field_bg};
+        color: {text};
         border: 1px solid {field_border};
         border-radius: 6px;
         padding: 3px 6px;
         min-height: 20px;
     }}
+    QLineEdit:hover, QComboBox:hover {{ border-color: #1976D2; }}
+    QLineEdit:focus, QComboBox:focus {{ border-color: #1976D2; }}
     QLineEdit:disabled, QComboBox:disabled {{ color: {muted}; }}
     QLineEdit[invalid="true"] {{ border: 1px solid #e53935; }}
+    QComboBox::drop-down {{
+        subcontrol-origin: padding; subcontrol-position: center right;
+        width: 18px; border-left: 1px solid {field_border};
+        border-top-right-radius: 6px; border-bottom-right-radius: 6px;
+    }}
+    QComboBox::down-arrow {{
+        width: 0; height: 0; margin-right: 4px;
+        border-left: 4px solid transparent; border-right: 4px solid transparent;
+        border-top: 5px solid {muted};
+    }}
     /* Dropdown popup: keep hovered/selected items readable (was white-on-white). */
     QComboBox QAbstractItemView {{
         background: {field_bg};
@@ -116,6 +129,7 @@ def build_stylesheet(dark):
         selection-color: #ffffff;
     }}
     QComboBox QAbstractItemView::item {{ min-height: 22px; padding: 2px 6px; color: {text}; }}
+    QComboBox QAbstractItemView::item:hover {{ background: #1976D2; color: #ffffff; }}
     QComboBox QAbstractItemView::item:selected {{ background: #1976D2; color: #ffffff; }}
     QPushButton {{
         background: {field_bg};
@@ -136,8 +150,8 @@ def build_stylesheet(dark):
 # LED indicator: a small painted dot (CTk had a canvas version).
 # ----------------------------------------------------------------------------
 class LedDot(QWidget):
-    def __init__(self, size=16):
-        super().__init__()
+    def __init__(self, size=16, parent=None):
+        super().__init__(parent)
         self._size = size
         self._color = QColor(theme.led("idle"))
         self.setFixedSize(size, size)
@@ -220,33 +234,37 @@ class ChannelCard(QFrame):
         self._grid.setHorizontalSpacing(6)
         self._grid.setVerticalSpacing(4)
 
+        # NOTE: every widget is parented to `self` (the card) at creation. If a
+        # child were left parentless, _clear()'s setVisible(True) would turn it
+        # into a floating top-level window (the "tiny windows flashing" bug, seen
+        # as QWindowsWindow::setGeometry warnings on *Window objects).
         ch = idx + 1
-        self.num = QLabel(f"Ch {ch}"); self.num.setObjectName("chNum")
-        self.led = LedDot()
-        self.enable = QCheckBox(); self.enable.setEnabled(False)
+        self.num = QLabel(f"Ch {ch}", self); self.num.setObjectName("chNum")
+        self.led = LedDot(parent=self)
+        self.enable = QCheckBox(self); self.enable.setEnabled(False)
         self.enable.stateChanged.connect(win._on_enable_changed)
-        self.label = QLineEdit(f"Laser {ch}"); self.label.setEnabled(False)
+        self.label = QLineEdit(f"Laser {ch}", self); self.label.setEnabled(False)
         self.label.textEdited.connect(win._mark_unsaved)
-        self.status = QLabel("Run Scan First"); self.status.setObjectName("status")
-        self.live_tec = QLabel("OFF"); self.live_tec.setAlignment(Qt.AlignCenter)
-        self.live_las = QLabel("OFF"); self.live_las.setAlignment(Qt.AlignCenter)
-        self.live_t = QLabel("0.0"); self.live_t.setObjectName("reading"); self.live_t.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.live_i = QLabel("0.0"); self.live_i.setObjectName("reading"); self.live_i.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.tec_cmd = QComboBox(); self.tec_cmd.addItems(["ON", "OFF"]); self.tec_cmd.setCurrentText("OFF"); self.tec_cmd.setEnabled(False)
+        self.status = QLabel("Run Scan First", self); self.status.setObjectName("status")
+        self.live_tec = QLabel("OFF", self); self.live_tec.setAlignment(Qt.AlignCenter)
+        self.live_las = QLabel("OFF", self); self.live_las.setAlignment(Qt.AlignCenter)
+        self.live_t = QLabel("0.0", self); self.live_t.setObjectName("reading"); self.live_t.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.live_i = QLabel("0.0", self); self.live_i.setObjectName("reading"); self.live_i.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.tec_cmd = QComboBox(self); self.tec_cmd.addItems(["ON", "OFF"]); self.tec_cmd.setCurrentText("OFF"); self.tec_cmd.setEnabled(False)
         self.tec_cmd.currentTextChanged.connect(win._mark_unsaved)
-        self.las_cmd = QComboBox(); self.las_cmd.addItems(["ON", "OFF"]); self.las_cmd.setCurrentText("OFF"); self.las_cmd.setEnabled(False)
+        self.las_cmd = QComboBox(self); self.las_cmd.addItems(["ON", "OFF"]); self.las_cmd.setCurrentText("OFF"); self.las_cmd.setEnabled(False)
         self.las_cmd.currentTextChanged.connect(win._mark_unsaved)
-        self.t_target = QLineEdit("22.0"); self.t_target.setEnabled(False); self.t_target.setValidator(QDoubleValidator())
+        self.t_target = QLineEdit("22.0", self); self.t_target.setEnabled(False); self.t_target.setValidator(QDoubleValidator())
         self.t_target.textEdited.connect(win._mark_unsaved)
-        self.i_target = QLineEdit("0.0"); self.i_target.setEnabled(False); self.i_target.setValidator(QDoubleValidator())
+        self.i_target = QLineEdit("0.0", self); self.i_target.setEnabled(False); self.i_target.setValidator(QDoubleValidator())
         self.i_target.textEdited.connect(win._mark_unsaved)
-        self.max_t = QLabel("-"); self.max_t.setObjectName("caption"); self.max_t.setAlignment(Qt.AlignCenter)
-        self.max_i = QLabel("-"); self.max_i.setObjectName("caption"); self.max_i.setAlignment(Qt.AlignCenter)
-        self.run = QPushButton("▶ Run Ch."); self.run.setEnabled(False)
+        self.max_t = QLabel("-", self); self.max_t.setObjectName("caption"); self.max_t.setAlignment(Qt.AlignCenter)
+        self.max_i = QLabel("-", self); self.max_i.setObjectName("caption"); self.max_i.setAlignment(Qt.AlignCenter)
+        self.run = QPushButton("▶ Run Ch.", self); self.run.setEnabled(False)
         self.run.clicked.connect(lambda: win.execute_channels([ch]))
 
         # Captions shown only in Cards view (Table view has a shared header).
-        self._caps = [QLabel(t) for t in
+        self._caps = [QLabel(t, self) for t in
                       ("Live TEC", "Live LAS", "Live T °C", "Live I mA", "TEC", "LAS", "Target T", "Target I", "Max limit")]
         for c in self._caps:
             c.setObjectName("caption")
@@ -444,21 +462,39 @@ class LDCMainWindow(QMainWindow):
         for c in self.cards:
             c.setParent(self.container); c.hide()
 
-        # --- Bottom panel: two rows. ---
-        bottom = QVBoxLayout(); bottom.setSpacing(8)
+        # --- Bottom panel: [ params + profile stacked ] ... [ presets | EMO | Run ] ---
+        bottom = QHBoxLayout(); bottom.setSpacing(16)
 
-        # Row 1: ramp params (left) | bulk target presets + EMO + Run/Stop (right)
-        row1 = QHBoxLayout(); row1.setSpacing(12)
+        # Left column: params row, then the profile row directly beneath it.
+        left = QVBoxLayout(); left.setSpacing(6)
+        params = QHBoxLayout(); params.setSpacing(8)
 
         def add_param(label, attr, default):
-            L = QLabel(label); L.setObjectName("hdr"); row1.addWidget(L)
+            L = QLabel(label); L.setObjectName("hdr"); params.addWidget(L)
             e = QLineEdit(default); e.setFixedWidth(72); e.setValidator(QDoubleValidator())
             e.textEdited.connect(self._mark_unsaved)
-            setattr(self, attr, e); row1.addWidget(e)
+            setattr(self, attr, e); params.addWidget(e)
         add_param("T Ramp (°C/s):", "t_ramp", "0.1")
         add_param("I Ramp (mA/s):", "i_ramp", "0.5")
         add_param("T OFF Target (°C):", "t_off", "22.0")
-        row1.addStretch(1)
+        params.addStretch(1)
+        left.addLayout(params)
+
+        profile = QHBoxLayout(); profile.setSpacing(8)
+        self.lbl_profile = QLabel("Active Profile: [Unsaved]"); self.lbl_profile.setObjectName("hdr")
+        profile.addWidget(self.lbl_profile)
+        self.btn_save = QPushButton("💾 Save Profile"); self.btn_save.clicked.connect(self.save_profile)
+        profile.addWidget(self.btn_save)
+        self.btn_load = QPushButton("📂 Load Profile"); self.btn_load.clicked.connect(self.load_profile)
+        profile.addWidget(self.btn_load)
+        self.btn_clear_prof = QPushButton("❌ Clear Profile"); self.btn_clear_prof.clicked.connect(self.clear_profile)
+        profile.addWidget(self.btn_clear_prof)
+        profile.addStretch(1)
+        left.addLayout(profile)
+        left.addStretch(1)
+        bottom.addLayout(left)
+
+        bottom.addStretch(1)
 
         # Bulk target presets: these only SET each channel's Target TEC/LAS; they
         # do not actuate hardware — the run happens when you press Run All. The
@@ -488,13 +524,13 @@ class LDCMainWindow(QMainWindow):
         mkmaster("TEC Off", lambda: self.set_all_dropdowns("TEC", "OFF"), "", 1, 1)
         mkmaster("LAS Off", lambda: self.set_all_dropdowns("LAS", "OFF"), "", 1, 2)
         pv.addLayout(mgrid)
-        row1.addWidget(preset)
+        bottom.addWidget(preset)
 
         self.btn_emo = QPushButton("⚠ EMO OFF"); self.btn_emo.setEnabled(False)
         self.btn_emo.setFixedWidth(104); self.btn_emo.setMinimumHeight(92)
         self.btn_emo.setStyleSheet("background:#b71c1c; color:white; font-size:14px; font-weight:bold; border-radius:8px;")
         self.btn_emo.clicked.connect(self.emergency_las_off)
-        row1.addWidget(self.btn_emo)
+        bottom.addWidget(self.btn_emo)
 
         run_col = QVBoxLayout(); run_col.setSpacing(6)
         self.btn_run_all = QPushButton("▶ RUN ALL"); self.btn_run_all.setEnabled(False)
@@ -507,21 +543,7 @@ class LDCMainWindow(QMainWindow):
         self.btn_stop.setStyleSheet("background:#c62828; color:white; font-weight:bold; border-radius:8px;")
         self.btn_stop.clicked.connect(self.stop_execution)
         run_col.addWidget(self.btn_stop)
-        row1.addLayout(run_col)
-        bottom.addLayout(row1)
-
-        # Row 2: profile management — prominent label with its buttons beside it.
-        row2 = QHBoxLayout(); row2.setSpacing(8)
-        self.lbl_profile = QLabel("Active Profile: [Unsaved]"); self.lbl_profile.setObjectName("hdr")
-        row2.addWidget(self.lbl_profile)
-        self.btn_save = QPushButton("💾 Save Profile"); self.btn_save.clicked.connect(self.save_profile)
-        row2.addWidget(self.btn_save)
-        self.btn_load = QPushButton("📂 Load Profile"); self.btn_load.clicked.connect(self.load_profile)
-        row2.addWidget(self.btn_load)
-        self.btn_clear_prof = QPushButton("❌ Clear Profile"); self.btn_clear_prof.clicked.connect(self.clear_profile)
-        row2.addWidget(self.btn_clear_prof)
-        row2.addStretch(1)
-        bottom.addLayout(row2)
+        bottom.addLayout(run_col)
 
         root.addLayout(bottom)
 
@@ -1101,12 +1123,22 @@ class LDCMainWindow(QMainWindow):
         text = "#e6e6e6" if self.dark else "#1a1a1a"
         qss = (f"QAbstractItemView {{ background: {field_bg}; color: {text}; outline: 0; }}"
                f"QAbstractItemView::item {{ color: {text}; padding: 3px 6px; min-height: 20px; }}"
+               f"QAbstractItemView::item:hover {{ background: #1976D2; color: #ffffff; }}"
                f"QAbstractItemView::item:selected {{ background: #1976D2; color: #ffffff; }}")
+        # Also fix the palette so the highlight is blue-on-white even if the style
+        # draws the hovered item via palette roles rather than the stylesheet.
+        pal = QPalette()
+        pal.setColor(QPalette.Base, QColor(field_bg))
+        pal.setColor(QPalette.Text, QColor(text))
+        pal.setColor(QPalette.Highlight, QColor("#1976D2"))
+        pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
         combos = [self.com_combo]
         for c in getattr(self, "cards", []):
             combos += [c.tec_cmd, c.las_cmd]
         for combo in combos:
-            combo.view().setStyleSheet(qss)
+            view = combo.view()
+            view.setStyleSheet(qss)
+            view.setPalette(pal)
 
     def _mark_unsaved(self, *_):
         if not self._unsaved:
