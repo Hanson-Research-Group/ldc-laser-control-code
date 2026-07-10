@@ -1,8 +1,6 @@
 # Newport LDC-3908 Modular Laser Diode Controller Software
 
-A production-grade, fully graphical desktop control suite for the **Newport LDC-3908 Modular Laser Diode Controller**. This software provides scientists and engineers with an intuitive, unified interface to configure, monitor, and safely ramp multi-laser setups.
-
-Developed by Zev Granowitz.
+A graphical desktop control suite for the **Newport LDC-3908 Modular Laser Diode Controller**. This software provides scientists and engineers with an intuitive, unified interface to configure, monitor, and safely ramp multi-laser setups.
 
 ---
 
