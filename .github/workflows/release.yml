@@ -35,6 +35,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/LDC3908_ModularLaserDiodeControllerSoftware.exe
-          fail_on_unsupported_ghost_writer: false
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
